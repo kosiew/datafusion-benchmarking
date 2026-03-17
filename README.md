@@ -224,3 +224,150 @@ One-time setup for GitHub Actions → GCP authentication:
 ## Observability
 
 We use [Logfire](https://logfire-us.pydantic.dev/l/join-adriangb/bavCVFu0iw) for tracing and metrics.
+
+---
+
+## How Results Are Generated
+
+### Runner workflow (inside the K8s Job pod)
+
+The runner binary dispatches to one of three workflows based on benchmark type:
+
+| JobType | Workflow | Comparison tool |
+|---|---|---|
+| `Standard` | Shell-script benchmarks (TPC-H, ClickBench) | `bench.sh compare_detail` |
+| `Criterion` | Criterion.rs microbenchmarks for DataFusion | `critcmp` |
+| `ArrowCriterion` | Criterion.rs microbenchmarks for Arrow-rs | `critcmp` |
+
+---
+
+### Standard workflow (`bench.sh`)
+
+```
+Clone PR branch     → /workspace/datafusion-branch
+Clone merge-base    → /workspace/datafusion-base
+Clone main          → /workspace/datafusion-bench  (provides a trusted bench.sh)
+        │
+        ▼
+Parallel: cargo build --release --bin dfbench (both sides)
+        │
+        ▼
+Post "🔄 Benchmark running..." comment with SHA + diff link
+        │
+        ▼
+For each benchmark (e.g. tpch_mem, clickbench):
+  1. Download/generate data (GCS cache → local fallback)
+  2. Run bench.sh   DATAFUSION_DIR=base_dir    RESULTS_NAME=HEAD
+  3. Run bench.sh   DATAFUSION_DIR=branch_dir  RESULTS_NAME=<branch>
+        │
+        ▼
+bench.sh compare_detail HEAD <branch_name>
+→ reads results/HEAD/ and results/<branch>/ JSON files
+→ outputs comparison table to stdout
+        │
+        ▼
+Post result comment to PR
+```
+
+> **Security**: `bench.sh` is always taken from `origin/main` (the third clone), not from the PR branch. This prevents a PR from modifying the benchmark runner script.
+
+---
+
+### Criterion workflow (`critcmp`)
+
+```
+Clone PR branch     → /workspace/datafusion-branch
+Clone merge-base    → /workspace/datafusion-base
+        │
+        ▼
+Parallel: cargo bench --bench <name> --no-run  (compile only, both sides)
+        │
+        ▼
+Run baseline:
+  cargo bench --bench <name> -- --save-baseline main
+  → writes JSON to base_dir/target/criterion/main/
+
+Run branch:
+  cargo bench --bench <name> -- --save-baseline <branch_name>
+  → writes JSON to branch_dir/target/criterion/<branch>/
+        │
+        ▼
+cp -r base_dir/target/criterion/. branch_dir/target/criterion/
+  (merge both result trees into one directory)
+        │
+        ▼
+critcmp main <branch_name>    ← produces the diff table
+        │
+        ▼
+Post result comment to PR
+```
+
+---
+
+## How to Interpret the Results
+
+### Standard benchmark comment
+
+The result comment looks like:
+
+```
+🤖 Benchmark completed (GKE) | trigger
+
+<details><summary>Details</summary>
+
+Query 1: HEAD=120ms  branch=115ms  (-4.2%)
+Query 2: HEAD=340ms  branch=351ms  (+3.2%)
+...
+
+</details>
+
+<details><summary>Resource Usage</summary>
+
+**tpch_mem — base (merge-base)**
+| Metric      | Value   |
+|-------------|---------|
+| Wall time   | 42.3s   |
+| Peak memory | 1.2 GiB |
+| Avg memory  | 800 MiB |
+| CPU user    | 38.1s   |
+| CPU sys     | 2.4s    |
+| Disk read   | 512 MiB |
+| Disk write  | 12.3 MiB|
+
+**tpch_mem — branch**
+...
+
+</details>
+```
+
+- **Percentages**: negative = PR is **faster**, positive = PR is **slower**.
+- **Resource Usage**: cgroup v2 measurements (wall clock, peak/avg RSS, CPU time, I/O) sampled every second during the run. Useful for catching memory regressions even when query time looks similar.
+
+---
+
+### Criterion benchmark comment
+
+```
+group                      main               my_branch
+-----                      ----               ---------
+sql_planner/tpch_q1        1.00  2.5±0.01ms  0.97  2.4±0.01ms
+sql_planner/tpch_q2        1.00 12.3±0.05ms  1.05 12.9±0.06ms
+```
+
+- **Baseline column** (`1.00`): the merge-base is always normalized to 1.00.
+- **PR column** (e.g. `0.97`): the PR's relative performance. **< 1.00 = faster**, **> 1.00 = slower**.
+- **`±` value**: Criterion's measured noise (standard deviation). Large `±` values mean noisy results — treat differences smaller than the noise with caution, especially on spot nodes.
+- **New benchmarks**: if the benchmark didn't exist in the merge-base, `critcmp` runs in single-baseline mode and the comment is marked *"branch-only results (no baseline comparison)"*.
+
+---
+
+### Error comment
+
+If the runner fails at any step, it posts:
+
+```
+❌ Benchmark failed
+<last 20 lines of build/test output>
+```
+
+The output file (`/tmp/benchmark_output.txt`) captures all stdout/stderr from every command in the job, so the tail typically shows the exact build or runtime error.
