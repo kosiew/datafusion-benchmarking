@@ -54,6 +54,10 @@ pub struct BenchmarkJob {
     pub error_message: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Random per-job token the runner uses to authenticate its
+    /// `POST /jobs/{id}/comment` calls against the controller. `None` for
+    /// legacy rows created before migration 003.
+    pub runner_token: Option<String>,
 }
 
 /// Parsed user intent from a PR comment (e.g. `run benchmark tpch_mem`).
@@ -70,13 +74,13 @@ pub struct BenchmarkRequest {
 
 /// Benchmark runner variant.
 ///
-/// - `Standard` — shell-based DataFusion benchmarks (tpch, clickbench, etc.)
-/// - `Criterion` — `cargo bench` criterion benchmarks in DataFusion
-/// - `ArrowCriterion` — `cargo bench` criterion benchmarks in arrow-rs
+/// - `Datafusion` — DataFusion benchmarks. The runner resolves each requested
+///   name per-benchmark: real `cargo bench` Criterion targets run via Criterion,
+///   everything else runs through `bench.sh`.
+/// - `ArrowCriterion` — `cargo bench` criterion benchmarks in arrow-rs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobType {
-    Standard,
-    Criterion,
+    Datafusion,
     ArrowCriterion,
 }
 
@@ -84,8 +88,7 @@ impl JobType {
     /// Returns the string stored in the `job_type` SQLite column.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Standard => "standard",
-            Self::Criterion => "criterion",
+            Self::Datafusion => "datafusion",
             Self::ArrowCriterion => "arrow_criterion",
         }
     }
@@ -164,13 +167,8 @@ mod tests {
     // ── JobType::as_str ─────────────────────────────────────────────
 
     #[test]
-    fn job_type_standard() {
-        assert_eq!(JobType::Standard.as_str(), "standard");
-    }
-
-    #[test]
-    fn job_type_criterion() {
-        assert_eq!(JobType::Criterion.as_str(), "criterion");
+    fn job_type_datafusion() {
+        assert_eq!(JobType::Datafusion.as_str(), "datafusion");
     }
 
     #[test]

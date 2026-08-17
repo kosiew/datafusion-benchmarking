@@ -47,22 +47,147 @@ GitHub PR comment                        GitHub PR
 
 Comment on a PR in `apache/datafusion` or `apache/arrow-rs`:
 
-```
+```yaml
 run benchmarks
 ```
 
 Or run specific benchmarks:
 
-```
+```yaml
 run benchmark tpch_mem clickbench_partitioned
 ```
 
-With environment variables:
+Or run specific benchmark suite with only a subset of commands
 
+```yaml
+run benchmark arrow_writer
+
+env:
+  BENCH_FILTER: float
 ```
-run benchmark tpch_mem
-DATAFUSION_RUNTIME_MEMORY_LIMIT=1G
+
+### Comparing specific branches or commits
+
+By default, benchmarks compare the PR's merge base (baseline) against the PR head (changed). You can override either side with any git ref (branch, tag, or commit SHA) using YAML:
+
+```yaml
+run benchmark tpch
+
+baseline:
+  ref: v45.0.0
+changed:
+  ref: v46.0.0
 ```
+
+You can also set just one side and leave the other as the default:
+
+```yaml
+run benchmark tpch
+baseline:
+  ref: main
+```
+
+### Per-side environment variables
+
+Environment variables can be set at three levels:
+
+**Shared** (applies to both baseline and changed):
+
+```yaml
+run benchmark tpch
+env:
+  RUST_LOG: debug
+```
+
+**Per-side** (different values for baseline vs changed):
+
+```yaml
+run benchmark tpch
+baseline:
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G
+changed:
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: 2G
+```
+
+**Combined** (shared + per-side + custom refs):
+
+```yaml
+run benchmark tpch clickbench_1
+env:
+  RUST_LOG: debug
+baseline:
+  ref: v45.0.0
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: 1G
+changed:
+  ref: v46.0.0
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: 2G
+```
+
+Per-side env vars override shared env vars when both set the same key.
+
+### What ran: the Run configuration block
+
+Every comment the runner posts — running, completed, and failed — states what it
+is benchmarking: a `Comparing <changed> (<sha>) to <baseline> [diff]` line, and a
+collapsed **Run configuration** block holding the refs and env vars in the same
+YAML the trigger accepts.
+
+It is re-rendered from the job rather than quoted from the trigger comment,
+because the two differ: one `run benchmark tpch clickbench_1` fans out into one
+job (and one comment) per name, and a bare `run benchmarks` expands to the repo's
+default suite. The block shows what *this* run did, so pasting it back into a PR
+comment reproduces that run on its own.
+
+```yaml
+run benchmark tpch
+env:
+  CARGO_BUILD_JOBS: "1"
+baseline:
+  ref: "v45.0.0"
+changed:
+  env:
+    DATAFUSION_RUNTIME_MEMORY_LIMIT: "2G"
+```
+
+Sections with nothing to report are omitted, so an unconfigured run renders as
+just its trigger line.
+
+### Peak memory pool reservation
+
+DataFusion records the high-water mark of `MemoryPool::reserved()` per query and
+writes it to the results JSON as `pool_peak_bytes`
+([apache/datafusion#23985](https://github.com/apache/datafusion/pull/23985)).
+The result comment renders it in a **Memory Pool Peaks** section: a per-query
+base-vs-changed table, plus the largest peak in each run paired against the peak
+RSS the [resource monitor](controller/src/runner/monitor.rs) sampled for the same
+invocation.
+
+DataFusion installs the recording pool only when a memory limit is configured, so
+the section appears only if you ask for one:
+
+```yaml
+run benchmark tpch
+env:
+  DATAFUSION_RUNTIME_MEMORY_LIMIT: 8G
+```
+
+Without a limit nothing is recorded, and the section is omitted rather than
+reported as zero. The same applies per side — comparing against a baseline that
+predates #23985 renders that column as `n/a` with a note saying why.
+
+This is measurement only. Nothing asserts a relationship between what the pool
+accounts for and what the process actually allocates; operators deliberately
+leave in-flight batches untracked, so the gap between the two is expected and is
+not gated on.
+
+Only benchmarks that go through `bench.sh`/`dfbench` produce a results JSON;
+Criterion targets have no equivalent and are absent from the section.
+
+### View the queue
 
 View the queue:
 
@@ -72,6 +197,11 @@ show benchmark queue
 
 ## Supported Benchmarks
 
+There is no allowlist: any name you pass is scheduled and resolved on the
+runner. Names that match a Criterion `[[bench]]` target run via Criterion;
+everything else runs through `bench.sh`. A name that matches neither fails on
+the runner. The tables below list the benchmarks known to work today.
+
 ### DataFusion (standard)
 
 | Benchmark | Description |
@@ -80,12 +210,21 @@ show benchmark queue
 | `tpch10` | TPC-H SF=10 |
 | `tpch_mem` | TPC-H SF=1 in-memory |
 | `tpch_mem10` | TPC-H SF=10 in-memory |
+| `topk_tpch` | Top-K TPC-H |
 | `clickbench_partitioned` | ClickBench partitioned Parquet |
 | `clickbench_extended` | ClickBench extended queries |
 | `clickbench_1` | ClickBench single-file Parquet |
 | `clickbench_pushdown` | ClickBench pushdown queries |
 | `external_aggr` | External aggregation |
 | `tpcds` | TPC-DS |
+| `smj` | Sort-merge join |
+| `sort_pushdown` | Sort pushdown |
+| `sort_pushdown_sorted` | Sort pushdown sorted |
+| `sort_pushdown_inexact` | Sort pushdown inexact |
+| `sort_pushdown_inexact_unsorted` | Sort pushdown inexact unsorted |
+| `sort_pushdown_inexact_overlap` | Sort pushdown inexact overlap |
+| `wide_schema` | Wide-schema parquet metadata overhead (1024 cols × 256 files; wide vs narrow) |
+| `predicate_eval` | Conjunctive (AND) filter-evaluation micro-benchmarks; subgroups exercise adaptive predicate ordering |
 
 ### DataFusion (criterion)
 
@@ -114,8 +253,11 @@ controller/                Rust controller crate
     github_poller.rs       Comment polling loop
     job_manager.rs         K8s Job lifecycle reconciler
     db.rs                  SQLite queries (jobs, seen comments, scan state)
-    benchmarks.rs          Trigger parsing, benchmark allowlists
+    benchmarks.rs          Trigger parsing (no allowlist — any name is accepted)
   migrations/              SQLite schema
+    runner/
+      monitor.rs           Peak/avg RSS, CPU and spill sampling per benchmark invocation
+      pool_peak.rs         Per-query `pool_peak_bytes` from the results JSON
 runner/                    Benchmark runner container (builds project, runs benchmarks, posts results)
 queries/                   SQL query files for ClickBench
 scripts/                   Legacy benchmark scripts (reference)
@@ -217,7 +359,7 @@ One-time setup for GitHub Actions → GCP authentication:
 | `github_poller` | Poll GitHub API, detect triggers, insert jobs |
 | `job_manager` | Create K8s Jobs, monitor status, post results |
 | `db` | SQLite persistence (jobs, seen comments, scan state) |
-| `benchmarks` | Trigger parsing, per-repo allowlists, classification |
+| `benchmarks` | Trigger parsing (no allowlist; benchmarks resolved on the runner) |
 | `github` | GitHub REST API client (comments, reactions) |
 | `config` | Environment-based configuration |
 

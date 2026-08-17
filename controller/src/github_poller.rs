@@ -10,11 +10,11 @@ use tracing::{info, warn};
 
 use crate::benchmarks::{
     allowed_users_markdown, detect_benchmark, is_benchmark_trigger, is_queue_request,
-    is_singular_no_names, supported_benchmarks_message, DetectResult,
+    is_singular_no_names, usage_message, DetectResult,
 };
-use crate::config::{BenchmarkConfig, Config, RepoEntry};
+use crate::config::{BenchmarkConfig, Config, RepoEntry, MAX_QUEUED_PER_USER};
 use crate::db;
-use crate::github::GitHubClient;
+use crate::github::{self, GitHubClient};
 use crate::models::{GitHubComment, JobInsert};
 
 /// Infinite loop that polls GitHub for new PR comments on each watched repo.
@@ -47,6 +47,7 @@ pub async fn poll_loop(
                 &config.benchmark_config,
                 repo,
                 config.poll_interval_secs,
+                config.runner_repo_url.as_deref(),
             )
             .await
             {
@@ -64,13 +65,14 @@ pub async fn poll_loop(
 }
 
 /// Fetch and process recent comments for a single repo.
-#[tracing::instrument(skip(pool, gh, bench_cfg, poll_interval_secs))]
+#[tracing::instrument(skip(pool, gh, bench_cfg, poll_interval_secs, runner_repo_url))]
 async fn poll_repo(
     pool: &SqlitePool,
     gh: &GitHubClient,
     bench_cfg: &BenchmarkConfig,
     repo: &str,
     poll_interval_secs: u64,
+    runner_repo_url: Option<&str>,
 ) -> Result<()> {
     let repo_entry = match bench_cfg.repos.get(repo) {
         Some(e) => e,
@@ -92,7 +94,17 @@ async fn poll_repo(
     info!(repo, count = comments.len(), "fetched comments");
 
     for comment in &comments {
-        if let Err(e) = process_comment(pool, gh, bench_cfg, repo, repo_entry, comment).await {
+        if let Err(e) = process_comment(
+            pool,
+            gh,
+            bench_cfg,
+            repo,
+            repo_entry,
+            comment,
+            runner_repo_url,
+        )
+        .await
+        {
             warn!(comment_id = comment.id, error = ?e, "process comment error");
         }
     }
@@ -111,12 +123,32 @@ fn not_allowed_message(
     login: &str,
     comment_url: &str,
     allowed_users: &std::collections::HashSet<String>,
+    runner_repo_url: Option<&str>,
 ) -> String {
+    let footer = github::issues_footer(runner_repo_url);
     format!(
         "Hi @{login}, thanks for the request ({comment_url}). \
          Only whitelisted users can trigger benchmarks. \
-         Allowed users: {}.",
+         Allowed users: {}.{footer}",
         allowed_users_markdown(allowed_users)
+    )
+}
+
+/// Build the reply posted when a user would exceed the per-user queued-jobs cap.
+fn rate_limit_message(
+    login: &str,
+    comment_url: &str,
+    pending: i64,
+    incoming: i64,
+    runner_repo_url: Option<&str>,
+) -> String {
+    let footer = github::issues_footer(runner_repo_url);
+    format!(
+        "Hi @{login}, thanks for the request ({comment_url}). \
+         You already have {pending} pending benchmark job(s), and this request \
+         would add {incoming} more — exceeding the per-user queue limit of \
+         {MAX_QUEUED_PER_USER}. Please wait for some of your current runs to \
+         finish before submitting more.{footer}"
     )
 }
 
@@ -128,6 +160,7 @@ async fn process_comment(
     repo: &str,
     repo_entry: &RepoEntry,
     comment: &GitHubComment,
+    runner_repo_url: Option<&str>,
 ) -> Result<()> {
     if db::is_comment_seen(pool, comment.id).await? {
         return Ok(());
@@ -137,6 +170,7 @@ async fn process_comment(
     let login = comment.login();
     let comment_url = comment.url();
     let issue_url = comment.issue_url_str();
+    let footer = github::issues_footer(runner_repo_url);
 
     let Some(pr_number) = pr_number_from_url(issue_url) else {
         return Ok(());
@@ -164,22 +198,25 @@ async fn process_comment(
     if is_queue_request(body) {
         info!(pr_number, login, "queue request");
         let jobs = db::get_queue_summary(pool).await?;
-        let msg = format_queue_message(login, comment_url, &jobs);
+        let msg = format!(
+            "{}{footer}",
+            format_queue_message(login, comment_url, &jobs)
+        );
         gh.post_comment(repo, pr_number, &msg).await?;
         mark_seen(pool, comment, repo, pr_number).await?;
         return Ok(());
     }
 
     // Try to detect benchmark trigger
-    let request = match detect_benchmark(repo_entry, body) {
+    let request = match detect_benchmark(body) {
         DetectResult::Parsed(req) => req,
         DetectResult::ConfigError(err) => {
             // YAML config was present but invalid — post a helpful error
             if bench_cfg.allowed_users.contains(login) {
                 let msg = format!(
                     "Hi @{login}, your benchmark configuration could not be parsed ({comment_url}).\n\n\
-                     **Error:** `{err}`\n\n{}",
-                    supported_benchmarks_message(repo_entry, &[])
+                     **Error:** `{err}`\n\n{}{footer}",
+                    usage_message()
                 );
                 gh.post_comment(repo, pr_number, &msg).await?;
             }
@@ -187,22 +224,19 @@ async fn process_comment(
             return Ok(());
         }
         DetectResult::None => {
-            // Check if it looks like a failed trigger attempt
+            // With no allowlist, named/default triggers always parse, so the
+            // only `None` cases that look like a trigger are `run benchmark`
+            // (singular) with no names.
             if is_benchmark_trigger(body) {
                 if !bench_cfg.allowed_users.contains(login) {
-                    let msg = not_allowed_message(login, comment_url, &bench_cfg.allowed_users);
+                    let msg = not_allowed_message(
+                        login,
+                        comment_url,
+                        &bench_cfg.allowed_users,
+                        runner_repo_url,
+                    );
                     gh.post_comment(repo, pr_number, &msg).await?;
                 } else {
-                    // Singular "run benchmark" with no names, or invalid names
-                    let requested: Vec<String> = body
-                        .trim()
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .split_whitespace()
-                        .skip(2)
-                        .map(|s| s.to_string())
-                        .collect();
                     let prefix = if is_singular_no_names(body) {
                         format!(
                             "Hi @{login}, `run benchmark` requires benchmark names ({comment_url}).\n\n"
@@ -210,10 +244,7 @@ async fn process_comment(
                     } else {
                         format!("Hi @{login}, thanks for the request ({comment_url}).\n\n")
                     };
-                    let msg = format!(
-                        "{prefix}{}",
-                        supported_benchmarks_message(repo_entry, &requested)
-                    );
+                    let msg = format!("{prefix}{}{footer}", usage_message());
                     gh.post_comment(repo, pr_number, &msg).await?;
                 }
             }
@@ -225,13 +256,36 @@ async fn process_comment(
 
     // User must be allowed — mark seen only after reply succeeds.
     if !bench_cfg.allowed_users.contains(login) {
-        let msg = not_allowed_message(login, comment_url, &bench_cfg.allowed_users);
+        let msg = not_allowed_message(
+            login,
+            comment_url,
+            &bench_cfg.allowed_users,
+            runner_repo_url,
+        );
         gh.post_comment(repo, pr_number, &msg).await?;
         mark_seen(pool, comment, repo, pr_number).await?;
         return Ok(());
     }
 
     info!(pr_number, login, benchmarks = ?request.benchmarks, "scheduling benchmark");
+
+    // Resolve default benchmarks when "run benchmarks" is used without specific names
+    let benchmarks = if request.benchmarks.is_empty() {
+        repo_entry.default_standard.clone()
+    } else {
+        request.benchmarks.clone()
+    };
+
+    // Per-user queued-jobs cap. One comment can insert multiple jobs (one per
+    // benchmark name); count them all against the cap before inserting any.
+    let incoming = benchmarks.len().max(1) as i64;
+    let pending = db::count_user_pending(pool, login).await?;
+    if pending + incoming > MAX_QUEUED_PER_USER {
+        let msg = rate_limit_message(login, comment_url, pending, incoming, runner_repo_url);
+        gh.post_comment(repo, pr_number, &msg).await?;
+        mark_seen(pool, comment, repo, pr_number).await?;
+        return Ok(());
+    }
 
     // Mark seen before insert_job — the FK on benchmark_jobs requires the
     // seen_comments row to exist first.
@@ -242,16 +296,12 @@ async fn process_comment(
     let baseline_env_json = serde_json::to_string(&request.baseline_env_vars)?;
     let changed_env_json = serde_json::to_string(&request.changed_env_vars)?;
 
-    // Resolve default benchmarks when "run benchmarks" is used without specific names
-    let benchmarks = if request.benchmarks.is_empty() {
-        repo_entry.default_standard.clone()
-    } else {
-        request.benchmarks.clone()
-    };
+    // The job type is per-repo (the datafusion runner resolves each name
+    // itself), so there is no per-benchmark classification.
+    let job_type = repo_entry.job_type().as_str();
 
-    // Determine job type(s) and insert jobs
     if benchmarks.is_empty() {
-        // No defaults configured — insert a single standard job (runner uses its own default)
+        // No defaults configured — insert a single job (runner uses its own default)
         let benchmarks_json = serde_json::to_string(&benchmarks)?;
         db::insert_job(
             pool,
@@ -267,18 +317,13 @@ async fn process_comment(
                 changed_env_vars: &changed_env_json,
                 baseline_ref: request.baseline_ref.as_deref(),
                 changed_ref: request.changed_ref.as_deref(),
-                job_type: "standard",
+                job_type,
             },
         )
         .await?;
     } else {
-        // Group benchmarks by type
+        // One job per benchmark so each runs in its own pod.
         for bench in &benchmarks {
-            let job_type = repo_entry
-                .classify_benchmark(bench)
-                .map(|jt| jt.as_str())
-                .unwrap_or("standard");
-
             let single_bench = serde_json::to_string(&[bench])?;
             db::insert_job(
                 pool,
@@ -388,10 +433,20 @@ mod tests {
     fn not_allowed_msg_contains_fields() {
         let users: std::collections::HashSet<String> =
             ["alamb"].iter().map(|s| s.to_string()).collect();
-        let msg = not_allowed_message("testuser", "https://example.com/comment/1", &users);
+        let msg = not_allowed_message("testuser", "https://example.com/comment/1", &users, None);
         assert!(msg.contains("@testuser"));
         assert!(msg.contains("https://example.com/comment/1"));
         assert!(msg.contains("whitelisted") || msg.contains("Whitelisted"));
+    }
+
+    #[test]
+    fn rate_limit_msg_contains_fields() {
+        let msg = rate_limit_message("alice", "https://example.com/c/9", 12, 4, None);
+        assert!(msg.contains("@alice"));
+        assert!(msg.contains("https://example.com/c/9"));
+        assert!(msg.contains("12 pending"));
+        assert!(msg.contains("would add 4"));
+        assert!(msg.contains("per-user queue limit of 15"));
     }
 
     // ── format_queue_message ────────────────────────────────────────
@@ -426,6 +481,7 @@ mod tests {
             error_message: None,
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
+            runner_token: None,
         };
         let msg = format_queue_message("bob", "https://example.com/c/2", &[job]);
         assert!(msg.contains("| Comment |"));

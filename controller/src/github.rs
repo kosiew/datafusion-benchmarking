@@ -12,6 +12,16 @@ use crate::models::GitHubComment;
 
 const API_BASE: &str = "https://api.github.com";
 
+/// Append the benchmark runner issues link if configured.
+pub fn issues_footer(runner_repo_url: Option<&str>) -> String {
+    match runner_repo_url {
+        Some(url) if !url.is_empty() => {
+            format!("\n\n---\n[File an issue]({url}/issues) against this benchmark runner")
+        }
+        _ => String::new(),
+    }
+}
+
 /// Maximum number of pages to fetch when paginating (10,000 comments at 100/page).
 const MAX_PAGES: usize = 100;
 
@@ -214,6 +224,26 @@ impl GitHubClient {
             .await
             .context("post comment")?;
         Ok(())
+    }
+
+    /// Look up a PR and return its `head.ref` (the source branch name).
+    /// Runner pods no longer have a `GITHUB_TOKEN`, so the controller
+    /// resolves this once and passes it to the pod via `PR_HEAD_REF`.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_pr_head_ref(&self, repo: &str, pr_number: i64) -> Result<String> {
+        #[derive(serde::Deserialize)]
+        struct PullHead {
+            #[serde(rename = "ref")]
+            ref_: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pull {
+            head: PullHead,
+        }
+        let url = format!("{API_BASE}/repos/{repo}/pulls/{pr_number}");
+        let resp = self.get_with_retry(&url, &[]).await?;
+        let pull: Pull = resp.json().await.context("parse pull json")?;
+        Ok(pull.head.ref_)
     }
 
     /// Add a reaction (e.g. "rocket") to a comment. Logs a warning on failure instead of erroring.

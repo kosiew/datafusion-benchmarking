@@ -87,6 +87,30 @@ const controllerRoleBinding = new k8s.rbac.v1.RoleBinding("benchmark-controller"
   }],
 }, { provider: k8sProvider, dependsOn: [controllerRole, controllerKsa] });
 
+// RBAC — allow the runner SA to read node metadata (for instance-type labels)
+const runnerNodeReaderRole = new k8s.rbac.v1.ClusterRole("benchmark-runner-node-reader", {
+  metadata: { name: "benchmark-runner-node-reader" },
+  rules: [{
+    apiGroups: [""],
+    resources: ["nodes"],
+    verbs: ["get"],
+  }],
+}, { provider: k8sProvider });
+
+const runnerNodeReaderBinding = new k8s.rbac.v1.ClusterRoleBinding("benchmark-runner-node-reader", {
+  metadata: { name: "benchmark-runner-node-reader" },
+  roleRef: {
+    apiGroup: "rbac.authorization.k8s.io",
+    kind: "ClusterRole",
+    name: "benchmark-runner-node-reader",
+  },
+  subjects: [{
+    kind: "ServiceAccount",
+    name: "benchmark-runner",
+    namespace: "benchmarking",
+  }],
+}, { provider: k8sProvider, dependsOn: [runnerNodeReaderRole, runnerKsa] });
+
 // StorageClass for benchmark runner workspace volumes
 const hyperdiskBalanced = new k8s.storage.v1.StorageClass("hyperdisk-balanced", {
   metadata: { name: "hyperdisk-balanced" },
@@ -102,6 +126,22 @@ const hyperdiskBalanced = new k8s.storage.v1.StorageClass("hyperdisk-balanced", 
 const imageTag = config.get("imageTag") || "latest";
 const controllerImage = pulumi.interpolate`${registryUrl}/controller:${imageTag}`;
 const runnerImage = pulumi.interpolate`${registryUrl}/runner:${imageTag}`;
+
+// ClusterIP Service so benchmark runner pods can reach the controller's
+// comment-proxy endpoint at
+// http://benchmark-controller.benchmarking.svc.cluster.local:8080.
+const controllerService = new k8s.core.v1.Service("benchmark-controller", {
+  metadata: {
+    name: "benchmark-controller",
+    namespace: "benchmarking",
+    labels: { app: "benchmark-controller" },
+  },
+  spec: {
+    selector: { app: "benchmark-controller" },
+    ports: [{ name: "http", port: 8080, targetPort: 8080, protocol: "TCP" }],
+    type: "ClusterIP",
+  },
+}, { provider: k8sProvider, dependsOn: [ns] });
 
 export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-controller", {
   metadata: {
@@ -142,38 +182,37 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
               allowed_users: [
                 "alamb", "Dandandan", "adriangb", "rluvaton", "geoffreyclaude",
                 "xudong963", "zhuqi-lucas", "Omega359", "comphead", "klion26",
-                "gabotechs", "Jefffrey", "etseidl", "kosiew",
+                "gabotechs", "Jefffrey", "etseidl", "kosiew", "mkleen", "coderfender",
+                "Rachelint", "2010YOUY01",
+                // top 15 contributors (last month) - apache/datafusion
+                "neilconway", "kumarUjjawal", "buraksenn", "friendlymatthew",
+                "erenavsarogullari", "timsaucer", "jonathanc-n", "haohuaijin",
+                "mbutrovich", "kevinjqliu",
+                // top 15 contributors (last month) - apache/arrow-rs
+                "mzabaluev", "sdf-jkl", "liamzwbao", "cetra3", "brunal",
+                "Fokko", "kunalsinghdadhwal", "grtlr", "codephage2020", "asubiotto",
               ],
+              // No benchmark allowlist: any requested name is scheduled and
+              // resolved on the runner. `kind` selects how the repo runs
+              // (datafusion = bench.sh + Criterion, resolved per-benchmark;
+              // arrow = arrow-rs Criterion). `default_standard` is the suite
+              // used by a bare `run benchmarks`.
               repos: {
                 "adriangb/datafusion": {
-                  standard: [
-                    "tpch", "tpch10", "tpch_mem", "tpch_mem10",
-                    "clickbench_partitioned", "clickbench_extended",
-                    "clickbench_1", "clickbench_pushdown",
-                    "external_aggr", "tpcds",
-                  ],
+                  kind: "datafusion",
                   default_standard: [
                     "clickbench_partitioned", "tpcds", "tpch",
                   ],
-                  criterion: ["*"],
                 },
                 "apache/datafusion": {
-                  standard: [
-                    "tpch", "tpch10", "tpch_mem", "tpch_mem10",
-                    "clickbench_partitioned", "clickbench_extended",
-                    "clickbench_1", "clickbench_pushdown",
-                    "external_aggr", "tpcds",
-                  ],
+                  kind: "datafusion",
                   default_standard: [
                     "clickbench_partitioned", "tpcds", "tpch",
                   ],
-                  criterion: ["*"],
                 },
                 "apache/arrow-rs": {
-                  standard: [],
+                  kind: "arrow",
                   default_standard: [],
-                  criterion: ["*"],
-                  criterion_type: "arrow",
                 },
               },
             }) },
@@ -187,6 +226,7 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
             ] : []),
             { name: "SCCACHE_GCS_BUCKET", value: sccacheGcsBucket },
             { name: "DATA_CACHE_BUCKET", value: dataCacheGcsBucket },
+            { name: "RUNNER_REPO_URL", value: config.get("runnerRepoUrl") || "" },
             { name: "LOGFIRE_SERVICE_NAME", value: "benchmark-controller" },
             { name: "LOGFIRE_ENVIRONMENT", value: "production" },
             {
@@ -195,8 +235,8 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
             },
           ],
           resources: {
-            requests: { cpu: "250m", memory: "256Mi" },
-            limits: { cpu: "500m", memory: "512Mi" },
+            requests: { cpu: "1", memory: "512Mi" },
+            limits: { cpu: "1", memory: "512Mi" },
           },
           volumeMounts: [{
             name: "controller-db",

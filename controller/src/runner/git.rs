@@ -25,7 +25,10 @@ pub async fn clone_shallow(repo_url: &str, dest: &Path, depth: u32) -> Result<()
 }
 
 /// Fetch the PR ref and main branch, then checkout the PR branch.
-/// Returns the branch name.
+/// Returns the branch name. PR-triggered pods get the branch name from
+/// the `PR_HEAD_REF` env var (injected by the controller); runs without
+/// it (main-tracking) fall back to `gh pr view`, which requires a
+/// `GITHUB_TOKEN`.
 pub async fn checkout_pr(pr_url: &str, dir: &Path) -> Result<String> {
     let pr_number = pr_url
         .trim_end_matches('/')
@@ -33,23 +36,26 @@ pub async fn checkout_pr(pr_url: &str, dir: &Path) -> Result<String> {
         .next()
         .context("failed to extract PR number from URL")?;
 
-    let branch_name = run_command(
-        "gh",
-        &[
-            "pr",
-            "view",
-            pr_url,
-            "--json",
-            "headRefName",
-            "--jq",
-            ".headRefName",
-        ],
-        dir,
-    )
-    .await
-    .context("gh pr view")?
-    .trim()
-    .to_string();
+    let branch_name = match std::env::var("PR_HEAD_REF") {
+        Ok(r) if !r.is_empty() => r,
+        _ => run_command(
+            "gh",
+            &[
+                "pr",
+                "view",
+                pr_url,
+                "--json",
+                "headRefName",
+                "--jq",
+                ".headRefName",
+            ],
+            dir,
+        )
+        .await
+        .context("gh pr view")?
+        .trim()
+        .to_string(),
+    };
 
     run_command(
         "git",
@@ -96,6 +102,24 @@ pub async fn checkout(dir: &Path, ref_: &str) -> Result<()> {
     )
     .await
     .context("git checkout")?;
+    Ok(())
+}
+
+/// Fetch the PR ref into an existing clone (without checking it out).
+pub async fn fetch_pr_ref(pr_url: &str, dir: &Path) -> Result<()> {
+    let pr_number = pr_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .context("failed to extract PR number from URL")?;
+
+    run_command(
+        "git",
+        &["fetch", "origin", &format!("refs/pull/{pr_number}/head")],
+        dir,
+    )
+    .await
+    .context("git fetch PR ref")?;
     Ok(())
 }
 

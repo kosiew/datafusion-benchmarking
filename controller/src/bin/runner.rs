@@ -6,9 +6,10 @@
 use anyhow::Result;
 use tracing::{error, info};
 
-use benchmark_controller::github::GitHubClient;
+use benchmark_controller::github;
 use benchmark_controller::runner::config::{BenchType, RunnerConfig};
-use benchmark_controller::runner::{bench_arrow, bench_criterion, bench_standard, shell};
+use benchmark_controller::runner::poster::CommentPoster;
+use benchmark_controller::runner::{bench_arrow, bench_datafusion, shell, trigger};
 
 #[tokio::main]
 async fn main() {
@@ -43,11 +44,11 @@ async fn main() {
         "starting benchmark runner"
     );
 
-    let gh = GitHubClient::new(&config.github_token);
+    let poster = config.build_poster();
 
-    if let Err(e) = run_benchmark(&config, &gh).await {
+    if let Err(e) = run_benchmark(&config, &poster).await {
         error!(error = %e, "benchmark failed");
-        post_error_comment(&config, &gh).await;
+        post_error_comment(&config, &poster).await;
         std::process::exit(1);
     }
 
@@ -55,25 +56,36 @@ async fn main() {
     shell::log_sccache_stats().await;
 }
 
-async fn run_benchmark(config: &RunnerConfig, gh: &GitHubClient) -> Result<()> {
+async fn run_benchmark(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     match config.bench_type {
-        BenchType::Standard | BenchType::MainTracking => bench_standard::run(config, gh).await,
-        BenchType::Criterion => bench_criterion::run(config, gh).await,
-        BenchType::ArrowCriterion => bench_arrow::run(config, gh).await,
+        BenchType::Datafusion | BenchType::MainTracking => {
+            bench_datafusion::run(config, poster).await
+        }
+        BenchType::ArrowCriterion => bench_arrow::run(config, poster).await,
     }
 }
 
-async fn post_error_comment(config: &RunnerConfig, gh: &GitHubClient) {
+async fn post_error_comment(config: &RunnerConfig, poster: &CommentPoster) {
     let tail = shell::tail_log(20).await;
 
+    // A failure can happen before either checkout resolves, so there is no
+    // comparison line here — just the requested configuration.
+    let bench_names = match config.bench_type {
+        BenchType::ArrowCriterion => config.bench_name.as_str(),
+        _ => config.benchmarks.as_str(),
+    };
+    let config_block = trigger::config_block(config, bench_names);
+
+    let footer = github::issues_footer(config.runner_repo_url.as_deref());
     let body = format!(
         "Benchmark for [this request]({}) failed.\n\n\
+         {config_block}\
          Last 20 lines of output:\n\
          <details><summary>Click to expand</summary>\n\n\
          ```\n\
          {tail}\n\
          ```\n\n\
-         </details>",
+         </details>{footer}",
         config.comment_url,
     );
 
@@ -85,7 +97,7 @@ async fn post_error_comment(config: &RunnerConfig, gh: &GitHubClient) {
         }
     };
 
-    if let Err(e) = gh.post_comment(&config.repo, pr_number, &body).await {
+    if let Err(e) = poster.post_comment(&config.repo, pr_number, &body).await {
         error!(error = %e, "failed to post error comment");
     }
 }

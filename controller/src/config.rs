@@ -5,38 +5,50 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// Per-repo benchmark allowlists loaded from JSON config.
+use crate::models::JobType;
+
+/// Maximum benchmark jobs a single user can have in the `running` state at once.
+/// Enforced at pickup in `db::get_pending_jobs`, so pending jobs sit in the
+/// queue until an earlier run finishes.
+pub const MAX_RUNNING_PER_USER: i64 = 5;
+
+/// Maximum benchmark jobs a single user can have in the `pending` state at once.
+/// Enforced at ingestion in `github_poller::process_comment`; the user is told
+/// to wait instead of silently dropping the request.
+pub const MAX_QUEUED_PER_USER: i64 = 15;
+
+/// Per-repo benchmark configuration loaded from JSON config.
+///
+/// There is no benchmark allowlist: any name a user requests is scheduled and
+/// resolved on the runner (a name that resolves to neither a Criterion bench
+/// target nor a `bench.sh` suite simply fails there). `kind` selects how the
+/// repo is benchmarked.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoEntry {
-    #[serde(default)]
-    pub standard: Vec<String>,
-    #[serde(default)]
-    pub criterion: Vec<String>,
-    /// `"datafusion"` (default) or `"arrow"` — controls criterion `JobType`.
-    #[serde(default = "default_criterion_type")]
-    pub criterion_type: String,
-    /// Default standard benchmarks for `"run benchmarks"` (no specific names).
+    /// `"datafusion"` (default) — `bench.sh` suites plus Criterion benches,
+    /// resolved per-benchmark on the runner — or `"arrow"` — arrow-rs Criterion
+    /// benches only.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// Default benchmarks for `"run benchmarks"` (no specific names).
     #[serde(default)]
     pub default_standard: Vec<String>,
 }
 
-fn default_criterion_type() -> String {
+fn default_kind() -> String {
     "datafusion".to_string()
 }
 
 impl RepoEntry {
-    pub fn standard_set(&self) -> HashSet<&str> {
-        self.standard.iter().map(|s| s.as_str()).collect()
-    }
-
-    pub fn criterion_set(&self) -> HashSet<&str> {
-        self.criterion.iter().map(|s| s.as_str()).collect()
-    }
-
-    /// Returns `true` if the criterion list contains `"*"`, meaning any
-    /// criterion benchmark name is accepted.
-    pub fn criterion_allows_any(&self) -> bool {
-        self.criterion.iter().any(|s| s == "*")
+    /// The [`JobType`] used to run every benchmark for this repo. The
+    /// datafusion runner resolves each name (Criterion vs `bench.sh`) itself,
+    /// so there is no per-benchmark classification.
+    pub fn job_type(&self) -> JobType {
+        if self.kind == "arrow" {
+            JobType::ArrowCriterion
+        } else {
+            JobType::Datafusion
+        }
     }
 }
 
@@ -68,6 +80,7 @@ pub struct BenchmarkConfig {
 /// STORAGE_CLASS             hyperdisk-balanced                    no
 /// SCCACHE_GCS_BUCKET        —                                     no
 /// DATA_CACHE_BUCKET          —                                     no
+/// RUNNER_REPO_URL            —                                     no
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -94,6 +107,8 @@ pub struct Config {
     pub sccache_gcs_bucket: Option<String>,
     /// GCS bucket for caching benchmark data (TPC-H, ClickBench, etc.).
     pub data_cache_bucket: Option<String>,
+    /// URL of the benchmark runner's own GitHub repo (for "file an issue" links).
+    pub runner_repo_url: Option<String>,
 }
 
 impl Config {
@@ -116,7 +131,7 @@ impl Config {
             default_memory: env_or("DEFAULT_MEMORY", "65Gi"),
             ephemeral_storage: env_or("EPHEMERAL_STORAGE", "128Gi"),
             default_machine_family: env_or("DEFAULT_MACHINE_FAMILY", "c4a"),
-            active_deadline_secs: env_or("ACTIVE_DEADLINE_SECS", "3600")
+            active_deadline_secs: env_or("ACTIVE_DEADLINE_SECS", "7200")
                 .parse()
                 .context("ACTIVE_DEADLINE_SECS")?,
             ttl_after_finished_secs: env_or("TTL_AFTER_FINISHED_SECS", "3600")
@@ -125,6 +140,7 @@ impl Config {
             storage_class: env_or("STORAGE_CLASS", "hyperdisk-balanced"),
             sccache_gcs_bucket: std::env::var("SCCACHE_GCS_BUCKET").ok(),
             data_cache_bucket: std::env::var("DATA_CACHE_BUCKET").ok(),
+            runner_repo_url: std::env::var("RUNNER_REPO_URL").ok(),
         })
     }
 }
