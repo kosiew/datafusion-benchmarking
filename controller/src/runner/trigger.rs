@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use crate::resources::PodResources;
 use crate::runner::config::RunnerConfig;
 
 /// The resolved two-sided comparison for a run.
@@ -44,11 +45,21 @@ impl Comparison<'_> {
 /// which is how the default suite is requested.
 pub fn config_block(config: &RunnerConfig, bench_names: &str) -> String {
     format!(
-        "<details><summary>Run configuration</summary>\n\n\
+        "{}<details><summary>Run configuration</summary>\n\n\
          ```yaml\n\
          {}\n\
          ```\n\n\
          </details>\n\n",
+        if config.shard.count() > 1 {
+            format!(
+                "**Shard {}/{}** · assignment `{}`\n\n",
+                config.shard.index + 1,
+                config.shard.count(),
+                crate::sharding::ASSIGNMENT_VERSION
+            )
+        } else {
+            String::new()
+        },
         config_yaml(config, bench_names)
     )
 }
@@ -62,6 +73,10 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
         lines.push("run benchmarks".to_string());
     } else {
         lines.push(format!("run benchmark {names}"));
+    }
+
+    if config.shard.count() > 1 {
+        lines.push(format!("shards: {}", config.shard.count()));
     }
 
     if !config.shared_env_vars.is_empty() {
@@ -82,6 +97,8 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
         &config.changed_env_vars,
     );
 
+    push_resources(&mut lines, &config.resources);
+
     // A trigger comment sets the filter through the shared `env:` block, which
     // is already rendered above. Only the scheduled main-tracking workflow sets
     // BENCH_FILTER outside that block — note it there so it isn't lost.
@@ -90,6 +107,25 @@ fn config_yaml(config: &RunnerConfig, bench_names: &str) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Append the `resources:` section, omitting it when the pod was built from
+/// the controller defaults. Only the fields the trigger named are rendered,
+/// so the block keeps asking for the same pod when it is pasted back.
+fn push_resources(lines: &mut Vec<String>, resources: &PodResources) {
+    if resources.is_empty() {
+        return;
+    }
+    lines.push("resources:".to_string());
+    for (key, value) in [
+        ("cpu", &resources.cpu),
+        ("memory", &resources.memory),
+        ("arch", &resources.arch),
+    ] {
+        if let Some(value) = value {
+            lines.push(format!("  {key}: {}", quote(value)));
+        }
+    }
 }
 
 /// Append a `baseline:`/`changed:` section, omitting it when the side has
@@ -155,7 +191,39 @@ mod tests {
             baseline_ref: None,
             changed_ref: None,
             runner_repo_url: None,
+            resources: PodResources::default(),
+            shard: crate::sharding::Shard::default(),
+            frozen_sources: None,
         }
+    }
+
+    #[test]
+    fn shard_override_round_trips_and_header_is_separate() {
+        for count in [1, 4] {
+            let mut cfg = config();
+            cfg.shard = crate::sharding::Shard {
+                count,
+                index: count - 1,
+            };
+            let yaml = config_yaml(&cfg, "arrow_writer");
+            assert_eq!(yaml.contains(&format!("shards: {count}")), count > 1);
+            let req = crate::benchmarks::detect_benchmark(
+                &yaml,
+                &crate::resources::ResourceLimits::default(),
+            );
+            let crate::benchmarks::DetectResult::Parsed(req) = req else {
+                panic!("invalid reproduction YAML")
+            };
+            assert_eq!(req.shards, (count > 1).then_some(count));
+            let block = config_block(&cfg, "arrow_writer");
+            assert_eq!(block.contains("**Shard"), count > 1);
+        }
+        let mut one = config();
+        one.shard.count = 1;
+        assert_eq!(
+            config_block(&one, "arrow_writer"),
+            config_block(&config(), "arrow_writer")
+        );
     }
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -208,9 +276,15 @@ mod tests {
         cfg.shared_env_vars = map(&[("CARGO_BUILD_JOBS", "1")]);
         cfg.baseline_ref = Some("v45.0.0".into());
         cfg.changed_env_vars = map(&[("DATAFUSION_RUNTIME_MEMORY_LIMIT", "2G")]);
+        cfg.resources = PodResources {
+            cpu: Some("16".into()),
+            memory: Some("128Gi".into()),
+            arch: Some("amd64".into()),
+        };
 
         let yaml = config_yaml(&cfg, "tpch clickbench_1");
-        let req = match crate::benchmarks::detect_benchmark(&yaml) {
+        let limits = crate::resources::ResourceLimits::default();
+        let req = match crate::benchmarks::detect_benchmark(&yaml, &limits) {
             crate::benchmarks::DetectResult::Parsed(req) => req,
             _ => panic!("re-rendered config did not parse: {yaml}"),
         };
@@ -222,6 +296,41 @@ mod tests {
                 .get("DATAFUSION_RUNTIME_MEMORY_LIMIT")
                 .unwrap(),
             "2G"
+        );
+        assert_eq!(req.resources, cfg.resources);
+    }
+
+    #[test]
+    fn yaml_omits_resources_for_a_default_sized_pod() {
+        assert_eq!(config_yaml(&config(), "tpch"), "run benchmark tpch");
+    }
+
+    #[test]
+    fn yaml_renders_the_requested_resources() {
+        let mut cfg = config();
+        cfg.resources = PodResources {
+            cpu: Some("16".into()),
+            memory: Some("128Gi".into()),
+            arch: Some("amd64".into()),
+        };
+        assert_eq!(
+            config_yaml(&cfg, "tpch"),
+            "run benchmark tpch\nresources:\n  cpu: \"16\"\n  memory: \"128Gi\"\n  arch: \"amd64\""
+        );
+    }
+
+    /// Only the fields the trigger named, so pasting the block back keeps the
+    /// rest on the controller defaults rather than pinning today's values.
+    #[test]
+    fn yaml_renders_only_the_requested_resource_fields() {
+        let mut cfg = config();
+        cfg.resources = PodResources {
+            memory: Some("128Gi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_yaml(&cfg, "tpch"),
+            "run benchmark tpch\nresources:\n  memory: \"128Gi\""
         );
     }
 

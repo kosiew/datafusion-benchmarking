@@ -7,9 +7,9 @@ use anyhow::Result;
 use tracing::{error, info};
 
 use benchmark_controller::github;
-use benchmark_controller::runner::config::{BenchType, RunnerConfig};
+use benchmark_controller::runner::config::{BenchType, PosterMode, RunnerConfig};
 use benchmark_controller::runner::poster::CommentPoster;
-use benchmark_controller::runner::{bench_arrow, bench_datafusion, shell, trigger};
+use benchmark_controller::runner::{bench_arrow, bench_datafusion, build_env, shell, trigger};
 
 #[tokio::main]
 async fn main() {
@@ -37,6 +37,9 @@ async fn main() {
     // Set up sccache if configured
     config.setup_sccache();
 
+    // Force the LTO mode and job cap every cargo build runs with.
+    build_env::apply();
+
     info!(
         bench_type = ?config.bench_type,
         pr_url = %config.pr_url,
@@ -47,13 +50,25 @@ async fn main() {
     let poster = config.build_poster();
 
     if let Err(e) = run_benchmark(&config, &poster).await {
-        error!(error = %e, "benchmark failed");
-        post_error_comment(&config, &poster).await;
+        // `{:#}` walks the context chain. The outermost context names only the
+        // step ("run multi_group_by (branch, criterion)"); the command's own
+        // stderr, which says what actually went wrong, is further down it.
+        error!(error = %format!("{e:#}"), "benchmark failed");
+        if runner_posts_failure_comment(&config.poster_mode, config.bench_type) {
+            post_error_comment(&config, &poster).await;
+        }
         std::process::exit(1);
     }
 
     // Log sccache stats if enabled
     shell::log_sccache_stats().await;
+}
+
+/// Proxy-mode runs are reconciled by the controller, which owns their
+/// terminal failure notification. Direct runs have no controller job record.
+/// Arrow uses its shared report formatter for direct failures.
+fn runner_posts_failure_comment(poster_mode: &PosterMode, bench_type: BenchType) -> bool {
+    bench_type != BenchType::ArrowCriterion && matches!(poster_mode, PosterMode::Direct { .. })
 }
 
 async fn run_benchmark(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
@@ -99,5 +114,35 @@ async fn post_error_comment(config: &RunnerConfig, poster: &CommentPoster) {
 
     if let Err(e) = poster.post_comment(&config.repo, pr_number, &body).await {
         error!(error = %e, "failed to post error comment");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_runners_leave_failure_comments_to_the_controller() {
+        let mode = PosterMode::Proxy {
+            controller_url: "http://controller".to_string(),
+            job_id: "1".to_string(),
+            token: "token".to_string(),
+        };
+
+        assert!(!runner_posts_failure_comment(&mode, BenchType::Datafusion));
+    }
+
+    #[test]
+    fn direct_runners_post_their_own_failure_comments() {
+        let mode = PosterMode::Direct {
+            github_token: "token".to_string(),
+        };
+
+        assert!(runner_posts_failure_comment(&mode, BenchType::Datafusion));
+        assert!(runner_posts_failure_comment(&mode, BenchType::MainTracking));
+        assert!(!runner_posts_failure_comment(
+            &mode,
+            BenchType::ArrowCriterion
+        ));
     }
 }

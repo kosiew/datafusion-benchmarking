@@ -6,7 +6,8 @@
 //!
 //! * If the name is a real Criterion `[[bench]]` target in the `benchmarks`
 //!   crate (discovered via `cargo metadata`), it is run with
-//!   `cargo bench --bench <name> -- --save-baseline <side>`.
+//!   `cargo bench --bench <name> -- --save-baseline <side>`, enabling whatever
+//!   `required-features` that target declares.
 //! * Otherwise it is run through `bench.sh run <name>` (TPC-H variants take a
 //!   direct `dfbench` shortcut). `bench.sh` itself runs some suites through the
 //!   Criterion SQL harness (`wide_schema`, …) and others through `dfbench`.
@@ -18,16 +19,30 @@
 //!
 //! `compare_detail` reports wall time only, so the same `results/<side>/*.json`
 //! are additionally read here for `pool_peak_bytes` — see
-//! [`pool_peak`](super::pool_peak).
+//! [`pool_peak`](super::pool_peak). The Criterion SQL harness writes the same
+//! JSON, without timings, to `results/<side>/criterion/`, which
+//! `compare_detail` does not read, so its suites get pool peaks without a
+//! second timing table. Criterion `[[bench]]` targets write no such JSON, so
+//! they have no pool peaks.
 
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::github;
+use crate::runner::build_env;
 use crate::runner::config::RunnerConfig;
+use crate::runner::criterion::{Criterion, Run};
+use crate::runner::execution::{execute, partition, CommandHarness, CommandRun};
+use crate::sharding::{Shard, ShardSupport};
+
+// Mixed DataFusion harnesses/setup lack uniform discovery and batched subset
+// execution. Enable sharding once their adapters implement that shared contract.
+pub const SHARD_SUPPORT: ShardSupport = ShardSupport::SingleWorkerOnly(
+    "DataFusion setup does not yet support uniform discovery and batched subset execution",
+);
 use crate::runner::git;
 use crate::runner::monitor::{self, ResourceStats};
 use crate::runner::pool_peak::{self, BenchPeaks};
@@ -37,6 +52,7 @@ use crate::runner::trigger;
 
 /// Run DataFusion benchmarks comparing a PR branch to its merge-base.
 pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
+    SHARD_SUPPORT.validate_execution(config.shard)?;
     let repo_url = config.repo_url();
     let benchmarks = &config.benchmarks;
 
@@ -81,7 +97,7 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     // bench target added in the PR is recognized.
     let requested: Vec<String> = benchmarks.split_whitespace().map(String::from).collect();
     let bench_targets = criterion_bench_targets(&branch_dir.join("benchmarks")).await;
-    let is_criterion = |bench: &str| bench_targets.contains(bench);
+    let is_criterion = |bench: &str| bench_targets.contains_key(bench);
     let any_shell = requested.iter().any(|b| !is_criterion(b));
 
     // dfbench is only needed for the bench.sh / TPC-H path. Build it for both
@@ -208,6 +224,10 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
 
     for bench in &requested {
         if is_criterion(bench) {
+            let required_features = bench_targets
+                .get(bench)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             info!("** Setting up data for criterion bench {bench} **");
             setup_criterion_data(bench, &branch_dir, &base_dir).await;
 
@@ -218,13 +238,16 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
                 &base_results_name,
                 &config.bench_filter,
                 &baseline_extra_env,
+                required_features,
+                config.shard,
             )
             .await
             {
-                Ok(stats) => {
+                Ok(Some(stats)) => {
                     criterion_base_ok = true;
                     base_stats_list.push((bench.clone(), stats));
                 }
+                Ok(None) => {}
                 Err(e) => {
                     // Most likely a new bench target absent on the base — fall
                     // back to a branch-only comparison for it.
@@ -239,11 +262,15 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
                 &bench_branch_name,
                 &config.bench_filter,
                 &changed_extra_env,
+                required_features,
+                config.shard,
             )
             .await
             .with_context(|| format!("run {bench} (branch, criterion)"))?;
-            criterion_branch_ok = true;
-            branch_stats_list.push((bench.clone(), stats));
+            if let Some(stats) = stats {
+                criterion_branch_ok = true;
+                branch_stats_list.push((bench.clone(), stats));
+            }
             continue;
         }
 
@@ -263,12 +290,15 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
             &base_results_name,
             &base_spill_dir,
             &baseline_extra_env,
+            config.shard,
         )
         .await
         .with_context(|| format!("run {bench} (base)"))?;
         let _ = tokio::fs::remove_dir_all(&base_spill_dir).await;
         base_peaks.extend(pool_peak::collect_new(&base_results_dir, &base_before, bench).await);
-        base_stats_list.push((bench.clone(), base_stats));
+        if let Some(stats) = base_stats {
+            base_stats_list.push((bench.clone(), stats));
+        }
 
         info!("** Running {bench} branch **");
         let branch_spill_dir = PathBuf::from(format!("/workspace/spill-branch-{bench}"));
@@ -281,13 +311,16 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
             &bench_branch_name,
             &branch_spill_dir,
             &changed_extra_env,
+            config.shard,
         )
         .await
         .with_context(|| format!("run {bench} (branch)"))?;
         let _ = tokio::fs::remove_dir_all(&branch_spill_dir).await;
         branch_peaks
             .extend(pool_peak::collect_new(&branch_results_dir, &branch_before, bench).await);
-        branch_stats_list.push((bench.clone(), branch_stats));
+        if let Some(stats) = branch_stats {
+            branch_stats_list.push((bench.clone(), stats));
+        }
     }
 
     // Compare and post results, driven by the artifacts that were produced:
@@ -368,9 +401,16 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     }
 
     let resource_section = format_resource_section(&base_stats_list, &branch_stats_list);
+    let limit_requested = pool_peak::memory_limit_requested([
+        &config.shared_env_vars,
+        &config.baseline_env_vars,
+        &config.changed_env_vars,
+    ]);
     let pool_section = pool_peak::format_pool_peak_section(
         &baseline_label,
         changed_display,
+        &requested,
+        limit_requested,
         &base_peaks,
         &branch_peaks,
         &base_stats_list,
@@ -395,11 +435,12 @@ pub async fn run(config: &RunnerConfig, poster: &CommentPoster) -> Result<()> {
     Ok(())
 }
 
-/// Discover Criterion `[[bench]]` target names in the `benchmarks` crate via
-/// `cargo metadata`. Returns an empty set on any failure — the caller then
+/// Discover Criterion `[[bench]]` targets in the `benchmarks` crate via
+/// `cargo metadata`, keyed by target name and carrying each target's
+/// `required-features`. Returns an empty map on any failure — the caller then
 /// treats every name as a `bench.sh` suite (which itself reports unknown
 /// names), so a metadata hiccup degrades gracefully rather than misrouting.
-async fn criterion_bench_targets(crate_dir: &Path) -> HashSet<String> {
+async fn criterion_bench_targets(crate_dir: &Path) -> BTreeMap<String, Vec<String>> {
     let out = match shell::run_command(
         "cargo",
         &["metadata", "--no-deps", "--format-version", "1"],
@@ -410,15 +451,23 @@ async fn criterion_bench_targets(crate_dir: &Path) -> HashSet<String> {
         Ok(out) => out,
         Err(e) => {
             warn!("cargo metadata failed; treating all benches as bench.sh suites: {e:#}");
-            return HashSet::new();
+            return BTreeMap::new();
         }
     };
     parse_bench_targets(&out)
 }
 
-/// Extract names of `bench`-kind targets from `cargo metadata` JSON.
-fn parse_bench_targets(metadata_json: &str) -> HashSet<String> {
-    let mut targets = HashSet::new();
+/// Extract `bench`-kind targets from `cargo metadata` JSON, keyed by target
+/// name and carrying the target's `required-features`.
+///
+/// The features are load-bearing: cargo refuses to run a bench target whose
+/// `required-features` are not enabled, and exits non-zero saying so rather
+/// than skipping it. `multi_group_by` in `datafusion-physical-plan` needs
+/// `test_utils`, for one. Target names are unique across the workspace in
+/// practice, but a collision takes the union of the requirements, because the
+/// run selects the target by name across every member.
+fn parse_bench_targets(metadata_json: &str) -> BTreeMap<String, Vec<String>> {
+    let mut targets: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata_json) else {
         return targets;
     };
@@ -435,14 +484,41 @@ fn parse_bench_targets(metadata_json: &str) -> HashSet<String> {
                 .and_then(|k| k.as_array())
                 .map(|kinds| kinds.iter().any(|k| k.as_str() == Some("bench")))
                 .unwrap_or(false);
-            if is_bench {
-                if let Some(name) = target.get("name").and_then(|n| n.as_str()) {
-                    targets.insert(name.to_string());
+            if !is_bench {
+                continue;
+            }
+            let Some(name) = target.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let entry = targets.entry(name.to_string()).or_default();
+            let required = target
+                .get("required-features")
+                .and_then(|f| f.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for feature in required.iter().filter_map(|f| f.as_str()) {
+                if !entry.iter().any(|f| f == feature) {
+                    entry.push(feature.to_string());
                 }
             }
         }
     }
     targets
+}
+
+/// The `--features` flag for a Criterion run: `parquet`, which the DataFusion
+/// bench targets have always been run with, plus the target's own
+/// `required-features`. The run is invoked from the workspace root, where
+/// cargo resolves each bare feature name against the members that declare it,
+/// so features owned by different packages can be listed together.
+fn criterion_features_arg(required_features: &[String]) -> String {
+    let mut features = vec!["parquet".to_string()];
+    for feature in required_features {
+        if !features.contains(feature) {
+            features.push(feature.clone());
+        }
+    }
+    format!("--features={}", features.join(","))
 }
 
 /// Run a Criterion bench target on one side, saving a named baseline.
@@ -455,30 +531,20 @@ async fn run_criterion_side(
     baseline_name: &str,
     bench_filter: &str,
     extra_env: &[String],
-) -> Result<ResourceStats> {
-    let mut bench_args: Vec<String> = vec![
-        "bench".into(),
-        "--features=parquet".into(),
-        "--bench".into(),
-        bench.into(),
-        "--".into(),
-        "--save-baseline".into(),
-        baseline_name.into(),
-    ];
-    if !bench_filter.is_empty() {
-        bench_args.push(bench_filter.to_string());
-    }
-    let (_, stats) = if extra_env.is_empty() {
-        let args_ref: Vec<&str> = bench_args.iter().map(|s| s.as_str()).collect();
-        shell::run_command_monitored("cargo", &args_ref, side_dir, None).await?
-    } else {
-        let mut env_args: Vec<String> = extra_env.to_vec();
-        env_args.push("cargo".to_string());
-        env_args.extend(bench_args);
-        let env_args_ref: Vec<&str> = env_args.iter().map(|s| s.as_str()).collect();
-        shell::run_command_monitored("env", &env_args_ref, side_dir, None).await?
+    required_features: &[String],
+    shard: Shard,
+) -> Result<Option<ResourceStats>> {
+    let harness = Criterion {
+        bench_args: vec![
+            "bench".into(),
+            criterion_features_arg(required_features),
+            "--bench".into(),
+            bench.into(),
+        ],
     };
-    Ok(stats)
+    let plan = Run::new(baseline_name, bench_filter, side_dir, extra_env);
+    let plan = partition(&harness, plan, shard, bench).await?;
+    execute(&harness, &plan).await
 }
 
 /// Run a single `bench.sh` benchmark on one side (base or branch).
@@ -499,9 +565,10 @@ async fn run_shell_side(
     results_name: &str,
     spill_dir: &Path,
     extra_env: &[String],
-) -> Result<ResourceStats> {
-    if let Some((tpch_args, results_filename)) = tpch_direct_args(bench) {
-        run_tpch_direct(
+    shard: Shard,
+) -> Result<Option<ResourceStats>> {
+    let command = if let Some((tpch_args, results_filename)) = tpch_direct_args(bench) {
+        tpch_command(
             side_dir,
             bench_benchmarks,
             results_name,
@@ -510,34 +577,69 @@ async fn run_shell_side(
             tpch_args,
             results_filename,
         )
-        .await
+        .await?
     } else {
-        let mut args: Vec<String> = vec![
-            format!("DATAFUSION_DIR={}", side_dir.display()),
-            format!("RESULTS_NAME={results_name}"),
-            format!("DATAFUSION_RUNTIME_TEMP_DIRECTORY={}", spill_dir.display()),
-            // Suites that bench.sh runs through the Criterion SQL harness read
-            // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
-            // dfbench-based suites (which never read it) and saves a named
-            // baseline per side for the ones that do, so we can critcmp them.
-            format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
-        ];
-        args.extend(extra_env.iter().cloned());
+        let mut args = shell_side_env_args(side_dir, results_name, spill_dir, extra_env);
         args.extend([
             "./bench.sh".to_string(),
             "run".to_string(),
             bench.to_string(),
         ]);
-        let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let (_, stats) = shell::run_command_monitored(
-            "env",
-            &args_ref,
-            bench_benchmarks,
-            Some(spill_dir.to_path_buf()),
-        )
-        .await?;
-        Ok(stats)
-    }
+        CommandRun {
+            program: "env".into(),
+            args,
+            cwd: bench_benchmarks.into(),
+            spill_dir: Some(spill_dir.into()),
+        }
+    };
+    let plan = partition(&CommandHarness, command, shard, bench).await?;
+    execute(&CommandHarness, &plan).await
+}
+
+/// `KEY=VALUE` args passed to `env` ahead of `./bench.sh run`. `env` applies
+/// them left to right, so the per-side `extra_env` overrides the runner's
+/// defaults, and [`build_env`]'s settings come last so nothing overrides them.
+fn shell_side_env_args(
+    side_dir: &Path,
+    results_name: &str,
+    spill_dir: &Path,
+    extra_env: &[String],
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        format!("DATAFUSION_DIR={}", side_dir.display()),
+        format!("RESULTS_NAME={results_name}"),
+        // Suites that bench.sh runs through the Criterion SQL harness read
+        // SQL_CARGO_COMMAND; setting it unconditionally is harmless for the
+        // dfbench-based suites (which never read it) and saves a named
+        // baseline per side for the ones that do, so we can critcmp them.
+        format!("SQL_CARGO_COMMAND=cargo bench --bench sql -- --save-baseline {results_name}"),
+    ];
+    args.extend(extra_env.iter().cloned());
+    // After `extra_env`, so a trigger cannot move the spill files away from
+    // the directory the monitor samples.
+    args.push(spill_tmpdir_arg(spill_dir));
+    // Also overrides the trigger's shared `env:` block, which the runner
+    // inherits from the pod.
+    args.extend(build_env::args());
+    args
+}
+
+/// `TMPDIR=<spill_dir>` for the benchmark process, so its spill files land in
+/// the directory the monitor samples for "Peak spill".
+///
+/// dfbench and the Criterion SQL harness build their runtime with
+/// `DiskManagerBuilder::default()`, which creates its spill directory under
+/// `std::env::temp_dir()`, that is `$TMPDIR` or `/tmp`. No DataFusion binary
+/// reads a `DATAFUSION_RUNTIME_TEMP_DIRECTORY` env var (runtime settings are
+/// not part of `ConfigOptions::from_env`), so `TMPDIR` is the only knob that
+/// works for every binary `bench.sh` starts.
+///
+/// Compilers that run inside the monitored command (`cargo bench --bench sql`)
+/// also write to `$TMPDIR`. The monitor only counts DataFusion's own spill
+/// directories, so that does not inflate the figure (see
+/// `monitor::spill_size`).
+fn spill_tmpdir_arg(spill_dir: &Path) -> String {
+    format!("TMPDIR={}", spill_dir.display())
 }
 
 /// Map a TPC-H bench name to (dfbench tpch args, results JSON filename).
@@ -573,7 +675,7 @@ fn tpch_direct_args(bench: &str) -> Option<(Vec<String>, String)> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_tpch_direct(
+async fn tpch_command(
     side_dir: &Path,
     bench_benchmarks: &Path,
     results_name: &str,
@@ -581,7 +683,7 @@ async fn run_tpch_direct(
     extra_env: &[String],
     tpch_args: Vec<String>,
     results_filename: String,
-) -> Result<ResourceStats> {
+) -> Result<CommandRun> {
     let dfbench = side_dir.join("target/release/dfbench");
     if !dfbench.exists() {
         anyhow::bail!("dfbench binary not found at {}", dfbench.display());
@@ -603,11 +705,8 @@ async fn run_tpch_direct(
         .ok_or_else(|| anyhow::anyhow!("missing --scale-factor in tpch args"))?;
     let data_path = bench_benchmarks.join(format!("data/tpch_sf{sf}"));
 
-    let mut env_args: Vec<String> = vec![format!(
-        "DATAFUSION_RUNTIME_TEMP_DIRECTORY={}",
-        spill_dir.display()
-    )];
-    env_args.extend(extra_env.iter().cloned());
+    let mut env_args: Vec<String> = extra_env.to_vec();
+    env_args.push(spill_tmpdir_arg(spill_dir));
     env_args.push(dfbench.to_string_lossy().into_owned());
     env_args.extend(tpch_args);
     env_args.extend([
@@ -617,15 +716,12 @@ async fn run_tpch_direct(
         results_file.to_string_lossy().into_owned(),
     ]);
 
-    let env_args_ref: Vec<&str> = env_args.iter().map(|s| s.as_str()).collect();
-    let (_, stats) = shell::run_command_monitored(
-        "env",
-        &env_args_ref,
-        bench_benchmarks,
-        Some(spill_dir.to_path_buf()),
-    )
-    .await?;
-    Ok(stats)
+    Ok(CommandRun {
+        program: "env".into(),
+        args: env_args,
+        cwd: bench_benchmarks.into(),
+        spill_dir: Some(spill_dir.into()),
+    })
 }
 
 /// Datasets a Criterion bench target needs generated before it can run.
@@ -767,10 +863,12 @@ fn format_resource_section(
 /// the "running" comment opened with — so the result stands on its own instead
 /// of only linking back to the trigger.
 ///
-/// `pool_section` is empty whenever no side recorded a `pool_peak_bytes` — the
-/// default, since runs set no memory limit unless the trigger comment asks for
-/// one. Its `<details>` block is then omitted entirely, leaving the comment as
-/// it was before the section existed.
+/// `pool_section` is empty whenever no side recorded a `pool_peak_bytes` and
+/// there is nothing to explain — the default, since runs set no memory limit
+/// unless the trigger comment asks for one. Its `<details>` block is then
+/// omitted entirely, leaving the comment as it was before the section existed.
+/// With a limit set, a Criterion-based benchmark (which records no peaks) gets
+/// a note there instead of silently producing nothing.
 #[allow(clippy::too_many_arguments)]
 fn format_result_comment(
     comment_url: &str,
@@ -821,6 +919,15 @@ fn format_result_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Value of the last `KEY=VALUE` assignment to `key` in `env_args`.
+    fn last_assignment(env_args: &[String], key: &str) -> Option<String> {
+        env_args.iter().rev().find_map(|a| {
+            a.split_once('=')
+                .filter(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        })
+    }
 
     #[test]
     fn result_comment_format() {
@@ -907,16 +1014,72 @@ mod tests {
             ]
         }"#;
         let targets = parse_bench_targets(json);
-        assert!(targets.contains("sql_planner"));
-        assert!(targets.contains("sql"));
-        assert!(!targets.contains("dfbench"));
-        assert!(!targets.contains("datafusion-benchmarks"));
+        assert!(targets.contains_key("sql_planner"));
+        assert!(targets.contains_key("sql"));
+        assert!(!targets.contains_key("dfbench"));
+        assert!(!targets.contains_key("datafusion-benchmarks"));
+    }
+
+    /// A target that declares `required-features` carries them through, so the
+    /// run can enable them. `multi_group_by` failed both sides of
+    /// apache/datafusion#23648 because `test_utils` was dropped here.
+    #[test]
+    fn parse_bench_targets_carries_required_features() {
+        let json = r#"{
+            "packages": [
+                {"targets": [
+                    {"name": "sql_planner", "kind": ["bench"]},
+                    {
+                        "name": "multi_group_by",
+                        "kind": ["bench"],
+                        "required-features": ["test_utils"]
+                    }
+                ]}
+            ]
+        }"#;
+        let targets = parse_bench_targets(json);
+        assert_eq!(targets["multi_group_by"], vec!["test_utils".to_string()]);
+        assert!(targets["sql_planner"].is_empty());
+    }
+
+    /// Two packages naming the same bench target contribute both requirements,
+    /// because `--bench <name>` selects across the whole workspace.
+    #[test]
+    fn parse_bench_targets_unions_colliding_names() {
+        let json = r#"{
+            "packages": [
+                {"targets": [
+                    {"name": "shared", "kind": ["bench"], "required-features": ["a"]}
+                ]},
+                {"targets": [
+                    {"name": "shared", "kind": ["bench"], "required-features": ["a", "b"]}
+                ]}
+            ]
+        }"#;
+        assert_eq!(
+            parse_bench_targets(json)["shared"],
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]
     fn parse_bench_targets_handles_garbage() {
         assert!(parse_bench_targets("not json").is_empty());
         assert!(parse_bench_targets("{}").is_empty());
+    }
+
+    #[test]
+    fn criterion_features_arg_appends_required_features() {
+        assert_eq!(criterion_features_arg(&[]), "--features=parquet");
+        assert_eq!(
+            criterion_features_arg(&["test_utils".to_string()]),
+            "--features=parquet,test_utils"
+        );
+        // A target that requires `parquet` itself does not repeat it.
+        assert_eq!(
+            criterion_features_arg(&["parquet".to_string()]),
+            "--features=parquet"
+        );
     }
 
     #[test]
@@ -930,6 +1093,83 @@ mod tests {
     #[test]
     fn required_datasets_unknown_is_empty() {
         assert!(required_datasets("wide_schema").is_empty());
+    }
+
+    fn side_env(extra_env: &[&str]) -> Vec<String> {
+        let extra_env: Vec<String> = extra_env.iter().map(|s| s.to_string()).collect();
+        shell_side_env_args(
+            Path::new("/workspace/base"),
+            "HEAD",
+            Path::new("/workspace/spill"),
+            &extra_env,
+        )
+    }
+
+    #[test]
+    fn shell_side_env_forces_build_settings() {
+        let args = side_env(&["RUST_LOG=debug"]);
+        assert_eq!(
+            last_assignment(&args, "CARGO_PROFILE_BENCH_LTO").as_deref(),
+            Some("thin")
+        );
+        assert_eq!(
+            last_assignment(&args, "CARGO_BUILD_JOBS").as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            last_assignment(&args, "SQL_CARGO_COMMAND").as_deref(),
+            Some("cargo bench --bench sql -- --save-baseline HEAD")
+        );
+        assert_eq!(last_assignment(&args, "RUST_LOG").as_deref(), Some("debug"));
+    }
+
+    #[test]
+    fn shell_side_env_trigger_cannot_override_build_settings() {
+        // Per-side env comes through `extra_env`. The shared env block is
+        // inherited, and any explicit arg overrides it, so the forced args
+        // win over both.
+        let args = side_env(&[
+            "CARGO_PROFILE_BENCH_LTO=fat",
+            "CARGO_PROFILE_RELEASE_LTO=fat",
+            "CARGO_BUILD_JOBS=12",
+        ]);
+        assert_eq!(
+            last_assignment(&args, "CARGO_PROFILE_BENCH_LTO").as_deref(),
+            Some("thin")
+        );
+        assert_eq!(
+            last_assignment(&args, "CARGO_BUILD_JOBS").as_deref(),
+            Some("5")
+        );
+        assert_eq!(
+            last_assignment(&args, "CARGO_PROFILE_RELEASE_LTO").as_deref(),
+            Some("thin")
+        );
+    }
+
+    #[test]
+    fn shell_side_env_per_side_env_still_applies() {
+        let args = side_env(&["DATAFUSION_RUNTIME_MEMORY_LIMIT=2G"]);
+        assert_eq!(
+            last_assignment(&args, "DATAFUSION_RUNTIME_MEMORY_LIMIT").as_deref(),
+            Some("2G")
+        );
+    }
+
+    #[test]
+    fn shell_side_env_points_tmpdir_at_spill_dir() {
+        // A trigger's TMPDIR must not move spill files away from the
+        // directory the monitor samples.
+        let args = side_env(&["TMPDIR=/elsewhere"]);
+        assert_eq!(
+            last_assignment(&args, "TMPDIR").as_deref(),
+            Some("/workspace/spill")
+        );
+        // Nothing reads this var, so the runner no longer sets it.
+        assert_eq!(
+            last_assignment(&args, "DATAFUSION_RUNTIME_TEMP_DIRECTORY"),
+            None
+        );
     }
 
     #[test]

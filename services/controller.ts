@@ -57,17 +57,26 @@ const logfireSecret = logfireToken ? new k8s.core.v1.Secret("logfire-token", {
   },
 }, { provider: k8sProvider, dependsOn: [ns] }) : undefined;
 
-// RBAC — allow the controller SA to manage batch Jobs in its namespace
+// RBAC — allow the controller SA to manage batch Jobs in its namespace, and to
+// read the log of a Job's pod so a terminal failure comment can quote the cause
+// instead of just the Kubernetes reason.
 const controllerRole = new k8s.rbac.v1.Role("benchmark-controller", {
   metadata: {
     name: "benchmark-controller",
     namespace: "benchmarking",
   },
-  rules: [{
-    apiGroups: ["batch"],
-    resources: ["jobs"],
-    verbs: ["create", "get", "list", "delete"],
-  }],
+  rules: [
+    {
+      apiGroups: ["batch"],
+      resources: ["jobs"],
+      verbs: ["create", "get", "list", "delete"],
+    },
+    {
+      apiGroups: [""],
+      resources: ["pods", "pods/log"],
+      verbs: ["get", "list"],
+    },
+  ],
 }, { provider: k8sProvider, dependsOn: [ns] });
 
 const controllerRoleBinding = new k8s.rbac.v1.RoleBinding("benchmark-controller", {
@@ -191,6 +200,7 @@ export const controllerStatefulSet = new k8s.apps.v1.StatefulSet("benchmark-cont
                 // top 15 contributors (last month) - apache/arrow-rs
                 "mzabaluev", "sdf-jkl", "liamzwbao", "cetra3", "brunal",
                 "Fokko", "kunalsinghdadhwal", "grtlr", "codephage2020", "asubiotto",
+                "Rich-T-kid", "avantgardnerio", "jayzhan211", "HippoBaro",
               ],
               // No benchmark allowlist: any requested name is scheduled and
               // resolved on the runner. `kind` selects how the repo runs

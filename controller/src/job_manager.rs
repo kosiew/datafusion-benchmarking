@@ -9,12 +9,12 @@ use anyhow::{Context, Result};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, EnvVar, EnvVarSource, EphemeralVolumeSource,
-    PersistentVolumeClaimTemplate, PodSpec, PodTemplateSpec, ResourceRequirements, SeccompProfile,
-    SecurityContext, Toleration, Volume, VolumeMount,
+    PersistentVolumeClaimTemplate, Pod, PodSpec, PodTemplateSpec, ResourceRequirements,
+    SeccompProfile, SecurityContext, Toleration, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, PostParams};
+use kube::api::{Api, ListParams, LogParams, PostParams};
 use kube::Client as KubeClient;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
@@ -62,6 +62,11 @@ pub async fn reconcile_loop(
         if let Err(e) = reconcile_active(&config, &pool, &gh, &kube_client).await {
             warn!(error = %e, "reconcile active error");
         }
+        if let Err(e) =
+            crate::shard_reporting::reconcile(&pool, &gh, config.runner_repo_url.as_deref()).await
+        {
+            warn!(error = %e, "reconcile shard reporting error");
+        }
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             _ = token.cancelled() => {
@@ -85,6 +90,19 @@ async fn reconcile_pending(
     let jobs_api: Api<Job> = Api::namespaced(kube.clone(), &config.k8s_namespace);
 
     for job in pending {
+        if job.uses_collected_results() {
+            if let Err(e) = crate::shard_reporting::ensure_started(
+                pool,
+                gh,
+                &job,
+                config.runner_repo_url.as_deref(),
+            )
+            .await
+            {
+                warn!(comment_id = job.comment_id, error = %e, "failed to post request start; leaving worker pending");
+                continue;
+            }
+        }
         // Generate the per-job runner token before creating the pod so the
         // token the pod ships with matches the row in SQLite. If the DB
         // write fails we don't attempt to create the K8s Job.
@@ -98,11 +116,16 @@ async fn reconcile_pending(
         // no GitHub credentials) doesn't need to call `gh pr view`. A
         // lookup failure is not fatal — we fall back to an empty value and
         // the runner will error cleanly if it actually needs it.
-        let pr_head_ref = match gh.get_pr_head_ref(&job.repo, job.pr_number).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(comment_id = job.comment_id, error = %e, "failed to resolve PR head ref");
-                String::new()
+        let pr_head_ref = if job.uses_collected_results() {
+            // Sharded workers use the source identities frozen at ingestion.
+            String::new()
+        } else {
+            match gh.get_pr_head_ref(&job.repo, job.pr_number).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(comment_id = job.comment_id, error = %e, "failed to resolve PR head ref");
+                    String::new()
+                }
             }
         };
 
@@ -126,10 +149,13 @@ async fn reconcile_pending(
                 let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
                 let footer = github::issues_footer(config.runner_repo_url.as_deref());
                 let msg = format!(
-                    "Failed to start benchmark for [this request]({comment_url}): {e}{footer}"
+                    "Failed to start benchmark{} for [this request]({comment_url}): {e}{footer}",
+                    job.shard_label()
                 );
-                if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &msg).await {
-                    warn!(error = %e, "failed to post error comment");
+                if !job.uses_collected_results() {
+                    if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &msg).await {
+                        warn!(error = %e, "failed to post error comment");
+                    }
                 }
             }
         }
@@ -192,13 +218,11 @@ async fn reconcile_active(
                     db::update_job_status(pool, job.id, JobStatus::Failed, None, Some(&err_msg))
                         .await?;
 
-                    // When a Job hits `activeDeadlineSeconds`, K8s SIGKILLs the
-                    // runner pod before the runner's `post_error_comment` can
-                    // fire. The controller posts the notification here so the
-                    // PR doesn't go silent.
-                    if reason == "DeadlineExceeded" {
-                        post_deadline_exceeded_comment(config, gh, &job, message).await;
-                    }
+                    // A terminal K8s failure can kill the runner before it
+                    // posts its own error comment. Notify from this reliable
+                    // controller-owned lifecycle boundary instead.
+                    post_terminal_failure_comment(config, pool, gh, kube, &job, reason, message)
+                        .await;
                 }
             }
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -224,42 +248,164 @@ async fn reconcile_active(
     Ok(())
 }
 
-/// Post a PR comment when a benchmark Job hits `activeDeadlineSeconds`.
+/// Post a PR comment for a terminal Kubernetes Job failure.
 ///
-/// The runner's own `post_error_comment` can't fire in this case because the
-/// deadline SIGKILLs the pod. Failures to post are logged but not propagated —
-/// the DB is already marked failed, and repeatedly retrying would risk double
-/// comments.
-async fn post_deadline_exceeded_comment(
+/// The runner can be killed before its own error handler posts a comment.
+/// Failures to post are logged but not propagated: the DB is already marked
+/// failed, and retrying here could create duplicate comments.
+async fn post_terminal_failure_comment(
     config: &Config,
+    pool: &SqlitePool,
     gh: &GitHubClient,
+    kube: &KubeClient,
     job: &BenchmarkJob,
+    reason: &str,
     k8s_message: &str,
 ) {
-    let benchmarks = serde_json::from_str::<Vec<String>>(&job.benchmarks)
-        .map(|v| v.join(", "))
-        .unwrap_or_else(|_| job.benchmarks.clone());
-    let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
-    let footer = github::issues_footer(config.runner_repo_url.as_deref());
-    let k8s_detail = if k8s_message.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\n<details><summary>Kubernetes message</summary>\n\n```\n{k8s_message}\n```\n\n</details>"
-        )
+    let log_tail = match job.k8s_job_name.as_deref() {
+        Some(name) => failed_pod_log_tail(kube, &config.k8s_namespace, name).await,
+        None => String::new(),
     };
-    let body = format!(
-        "Benchmark for [this request]({comment_url}) hit the {deadline}s job deadline before finishing.\n\n\
-         Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
-        deadline = config.active_deadline_secs,
+    let body = terminal_failure_comment_body(
+        config.active_deadline_secs,
+        config.runner_repo_url.as_deref(),
+        job,
+        reason,
+        k8s_message,
+        &log_tail,
     );
+    if job.uses_collected_results() {
+        // Preserve the controller-owned log/deadline diagnostics for the one
+        // final target notification, even when the runner never submitted.
+        if let Err(e) =
+            db::update_job_status(pool, job.id, JobStatus::Failed, None, Some(&body)).await
+        {
+            warn!(job_id = job.id, error = %e, "failed to persist shard failure detail");
+        }
+        return;
+    }
     if let Err(e) = gh.post_comment(&job.repo, job.pr_number, &body).await {
         warn!(
             comment_id = job.comment_id,
             error = %e,
-            "failed to post deadline-exceeded comment"
+            reason,
+            "failed to post terminal failure comment"
         );
     }
+}
+
+/// Format the controller-owned notification for a terminal Kubernetes failure.
+fn terminal_failure_comment_body(
+    active_deadline_secs: i64,
+    runner_repo_url: Option<&str>,
+    job: &BenchmarkJob,
+    reason: &str,
+    k8s_message: &str,
+    log_tail: &str,
+) -> String {
+    let benchmarks = format!(
+        "{}{}",
+        serde_json::from_str::<Vec<String>>(&job.benchmarks)
+            .map(|v| v.join(", "))
+            .unwrap_or_else(|_| job.benchmarks.clone()),
+        job.shard_label()
+    );
+    let comment_url = format!("{}#issuecomment-{}", job.pr_url, job.comment_id);
+    let footer = github::issues_footer(runner_repo_url);
+    let k8s_detail = if k8s_message.is_empty() {
+        String::new()
+    } else {
+        let fence = markdown_code_fence(k8s_message);
+        format!(
+            "\n\n<details><summary>Kubernetes message</summary>\n\n{fence}\n{k8s_message}\n{fence}\n\n</details>"
+        )
+    };
+    // The Kubernetes reason says the pod exited non-zero, never why. The
+    // runner's own last words do, so lead the details with them.
+    let log_detail = if log_tail.is_empty() {
+        String::new()
+    } else {
+        let fence = markdown_code_fence(log_tail);
+        format!(
+            "\n\n<details><summary>Runner log (last {POD_LOG_TAIL_LINES} lines)</summary>\n\n{fence}\n{log_tail}\n{fence}\n\n</details>"
+        )
+    };
+    let k8s_detail = format!("{log_detail}{k8s_detail}");
+
+    if reason == "DeadlineExceeded" {
+        format!(
+            "Benchmark for [this request]({comment_url}) hit the {active_deadline_secs}s job deadline before finishing.\n\n\
+             Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
+        )
+    } else {
+        let reason = if reason.is_empty() {
+            "an unspecified Kubernetes error"
+        } else {
+            reason
+        };
+        format!(
+            "Benchmark for [this request]({comment_url}) failed before finishing (Kubernetes reason: `{reason}`).\n\n\
+             Benchmarks requested: `{benchmarks}`{k8s_detail}{footer}",
+        )
+    }
+}
+
+/// How much of the failed pod's log to quote back into the PR comment. Enough
+/// to carry a cargo error and the command that produced it, short enough that
+/// the comment stays readable when expanded.
+const POD_LOG_TAIL_LINES: i64 = 40;
+
+/// Tail of the failed pod's log, for the terminal-failure comment.
+///
+/// A benchmark that fails on its own terms (an unknown bench name, a target
+/// whose `required-features` are not enabled, a compile error) dies inside the
+/// pod, and the Job condition the controller sees carries only
+/// `BackoffLimitExceeded`. Quoting the log puts the actual cause in the PR,
+/// where the person who triggered the run can read it without cluster access.
+///
+/// Best effort: any failure here yields an empty string and the comment simply
+/// omits the section, rather than losing the notification altogether.
+async fn failed_pod_log_tail(kube: &KubeClient, namespace: &str, k8s_job_name: &str) -> String {
+    let pods: Api<Pod> = Api::namespaced(kube.clone(), namespace);
+    let list_params = ListParams::default().labels(&format!("job-name={k8s_job_name}"));
+    let pod_list = match pods.list(&list_params).await {
+        Ok(list) => list,
+        Err(e) => {
+            warn!(k8s_job_name, error = %e, "failed to list pods for failed job");
+            return String::new();
+        }
+    };
+
+    // The newest pod is the one that failed last. `backoffLimit` is 0, so there
+    // is normally exactly one, but a preempted spot node can leave an earlier
+    // pod behind whose log describes a different run.
+    let Some(pod_name) = pod_list
+        .items
+        .iter()
+        .max_by_key(|p| p.metadata.creation_timestamp.clone().map(|t| t.0))
+        .and_then(|p| p.metadata.name.clone())
+    else {
+        warn!(k8s_job_name, "no pods found for failed job");
+        return String::new();
+    };
+
+    let log_params = LogParams {
+        tail_lines: Some(POD_LOG_TAIL_LINES),
+        ..Default::default()
+    };
+    match pods.logs(&pod_name, &log_params).await {
+        Ok(logs) => logs.trim_end().to_string(),
+        Err(e) => {
+            warn!(pod_name, error = %e, "failed to read log of failed pod");
+            String::new()
+        }
+    }
+}
+
+/// Return a Markdown code fence that cannot be closed by `content`.
+fn markdown_code_fence(content: &str) -> String {
+    let longest_run = content.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat(3.max(longest_run + 1))
 }
 
 /// Shorthand for constructing a plain-value [`EnvVar`].
@@ -269,6 +415,29 @@ fn env_var(name: &str, value: impl Into<String>) -> EnvVar {
         value: Some(value.into()),
         ..Default::default()
     }
+}
+
+/// Keep all new protocol metadata out of the benchmark's environment.
+fn shard_args(job: &BenchmarkJob) -> Result<Option<Vec<String>>> {
+    if !job.uses_collected_results() {
+        return Ok(None);
+    }
+    let shard = job.shard()?;
+    let sources: crate::sharding::FrozenSources = serde_json::from_str(
+        job.resolved_source_json
+            .as_deref()
+            .context("missing frozen shard sources")?,
+    )?;
+    sources.validate()?;
+    let config = crate::sharding::WorkerShard {
+        version: crate::sharding::ASSIGNMENT_VERSION.into(),
+        shard,
+        sources,
+    };
+    Ok(Some(vec![
+        crate::sharding::WORKER_FLAG.into(),
+        serde_json::to_string(&config)?,
+    ]))
 }
 
 /// Generate a random 32-byte hex token used to authenticate the runner
@@ -331,6 +500,46 @@ fn sanitize_label(s: &str) -> String {
     }
 }
 
+/// Where a benchmark pod runs and how big it is.
+///
+/// Each field is the job's own request when it has one, and the controller
+/// default otherwise.
+struct Placement<'a> {
+    cpu: &'a str,
+    memory: &'a str,
+    /// GCE machine family for the node selector.
+    machine_family: &'a str,
+    /// `kubernetes.io/arch` value matching `machine_family`.
+    arch: &'a str,
+}
+
+impl<'a> Placement<'a> {
+    fn resolve(
+        job: &'a BenchmarkJob,
+        default_cpu: &'a str,
+        default_memory: &'a str,
+        default_machine_family: &'a str,
+    ) -> Self {
+        // `x86_64` is not trigger syntax; it is accepted for rows written
+        // before the trigger could ask for an architecture.
+        let machine_family = match job.cpu_arch.as_deref() {
+            Some("arm64") => "c4a",
+            Some("amd64") | Some("x86_64") => "c4",
+            _ => default_machine_family,
+        };
+        Self {
+            cpu: job.cpu_request.as_deref().unwrap_or(default_cpu),
+            memory: job.memory_request.as_deref().unwrap_or(default_memory),
+            machine_family,
+            arch: if machine_family == "c4a" {
+                "arm64"
+            } else {
+                "amd64"
+            },
+        }
+    }
+}
+
 /// Build and submit a K8s Job spec for a benchmark row.
 ///
 /// Resource defaults come from [`Config`]. Tolerates GKE spot instances.
@@ -346,6 +555,7 @@ async fn create_k8s_job(
     pr_head_ref: &str,
 ) -> Result<String> {
     let benchmarks: Vec<String> = serde_json::from_str(&job.benchmarks)?;
+    let args = shard_args(job)?;
 
     // Parse shared env vars — accept both legacy `["K=V"]` array and new `{"K":"V"}` map
     let shared_env_vars: std::collections::HashMap<String, String> =
@@ -364,11 +574,18 @@ async fn create_k8s_job(
 
     let job_name = format!("bench-c{}-{}", job.comment_id, job.id);
 
-    let cpu = job.cpu_request.as_deref().unwrap_or(&config.default_cpu);
-    let memory = job
-        .memory_request
-        .as_deref()
-        .unwrap_or(&config.default_memory);
+    let placement = Placement::resolve(
+        job,
+        &config.default_cpu,
+        &config.default_memory,
+        &config.default_machine_family,
+    );
+    let Placement {
+        cpu,
+        memory,
+        machine_family,
+        arch,
+    } = placement;
 
     let mut env = vec![
         env_var("PR_URL", job.pr_url.clone()),
@@ -394,12 +611,16 @@ async fn create_k8s_job(
         // gdb dumps from hung jobs by adding a shared `env:` block to the
         // trigger comment (shared env is inherited by the build processes,
         // unlike per-side `baseline:`/`changed:` env which only reaches the
-        // benchmark run). To keep memory in check, pair it with a job cap:
+        // benchmark run):
         //
         //   run benchmark <name>
         //   env:
         //     CARGO_PROFILE_RELEASE_DEBUG: "1"
-        //     CARGO_BUILD_JOBS: "1"
+        //
+        // The job cap that used to pair with this is now forced by the runner
+        // (see runner/build_env.rs), and a trigger cannot lower it. Debuginfo
+        // makes each rustc much larger, so if such a run is OOM-killed, lower
+        // the cap there instead.
     ];
 
     // The controller resolves the PR's source branch and hands it to the
@@ -457,17 +678,19 @@ async fn create_k8s_job(
         env.push(env_var("RUNNER_REPO_URL", url.clone()));
     }
 
-    // Map per-job cpu_arch (arm64/amd64) to a machine family, or use the config default.
-    let machine_family = match job.cpu_arch.as_deref() {
-        Some("arm64") => "c4a",
-        Some("amd64") | Some("x86_64") => "c4",
-        _ => &config.default_machine_family,
-    };
-    let arch = if machine_family == "c4a" {
-        "arm64"
-    } else {
-        "amd64"
-    };
+    // Pass the trigger's own resource request, so the runner's "Run
+    // configuration" block reproduces the run instead of implying the
+    // defaults. The pod's actual limits reach the runner separately, through
+    // the Downward API vars below.
+    for (name, value) in [
+        ("REQUESTED_CPU", &job.cpu_request),
+        ("REQUESTED_MEMORY", &job.memory_request),
+        ("REQUESTED_ARCH", &job.cpu_arch),
+    ] {
+        if let Some(value) = value {
+            env.push(env_var(name, value.clone()));
+        }
+    }
 
     // Expose pod metadata via the Downward API so the runner can include
     // instance details in PR comments.
@@ -570,6 +793,7 @@ async fn create_k8s_job(
                     containers: vec![Container {
                         name: "runner".into(),
                         image: Some(config.runner_image.clone()),
+                        args,
                         env: Some(env),
                         resources: Some(ResourceRequirements {
                             requests: Some(resource_requests),
@@ -673,5 +897,228 @@ mod tests {
         // Very unlikely to repeat.
         let tok2 = generate_runner_token();
         assert_ne!(tok, tok2);
+    }
+
+    fn test_job() -> BenchmarkJob {
+        BenchmarkJob {
+            id: 1,
+            comment_id: 123,
+            repo: "apache/datafusion".to_string(),
+            pr_number: 42,
+            pr_url: "https://github.com/apache/datafusion/pull/42".to_string(),
+            login: "alice".to_string(),
+            benchmarks: r#"["tpch"]"#.to_string(),
+            env_vars: "{}".to_string(),
+            baseline_env_vars: "{}".to_string(),
+            changed_env_vars: "{}".to_string(),
+            baseline_ref: None,
+            changed_ref: None,
+            job_type: "standard".to_string(),
+            cpu_request: None,
+            memory_request: None,
+            cpu_arch: None,
+            k8s_job_name: Some("bench-c123-1".to_string()),
+            status: "running".to_string(),
+            error_message: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            runner_token: None,
+            effective_shards: 1,
+            shard_index: 0,
+            assignment_version: None,
+            resolved_source_json: None,
+        }
+    }
+
+    #[test]
+    fn criterion_worker_arguments_use_one_protocol_at_every_count() {
+        let mut job = test_job();
+        assert!(shard_args(&job).unwrap().is_none());
+        assert!(job.shard_label().is_empty());
+        job.job_type = "arrow_criterion".into();
+        job.assignment_version = Some(crate::sharding::ASSIGNMENT_VERSION.into());
+        job.resolved_source_json = Some(
+            serde_json::to_string(&crate::sharding::FrozenSources {
+                baseline_sha: "a".repeat(40),
+                changed_sha: "b".repeat(40),
+                pr_head_ref: "branch".into(),
+            })
+            .unwrap(),
+        );
+        for count in [1, 2, 4, 8] {
+            job.effective_shards = count;
+            let args = shard_args(&job).unwrap().unwrap();
+            let worker = crate::sharding::WorkerShard::from_args(args.into_iter())
+                .unwrap()
+                .unwrap();
+            assert_eq!(worker.shard.count(), count);
+            assert_eq!(worker.sources.changed_sha, "b".repeat(40));
+        }
+    }
+
+    /// Every field falls back to the controller default.
+    #[test]
+    fn placement_without_a_request_uses_the_defaults() {
+        let job = test_job();
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.cpu, "12");
+        assert_eq!(placement.memory, "65Gi");
+        assert_eq!(placement.machine_family, "c4a");
+        assert_eq!(placement.arch, "arm64");
+    }
+
+    #[test]
+    fn placement_uses_the_requested_cpu_and_memory() {
+        let mut job = test_job();
+        job.cpu_request = Some("16".into());
+        job.memory_request = Some("128Gi".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.cpu, "16");
+        assert_eq!(placement.memory, "128Gi");
+        // Untouched by a size-only request.
+        assert_eq!(placement.machine_family, "c4a");
+    }
+
+    /// One field at a time: a CPU request must not also move the pod off the
+    /// default memory.
+    #[test]
+    fn placement_mixes_a_request_with_the_defaults() {
+        let mut job = test_job();
+        job.cpu_request = Some("32".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.cpu, "32");
+        assert_eq!(placement.memory, "65Gi");
+    }
+
+    #[test]
+    fn placement_maps_arch_to_a_machine_family() {
+        let mut job = test_job();
+
+        job.cpu_arch = Some("amd64".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.machine_family, "c4");
+        assert_eq!(placement.arch, "amd64");
+
+        job.cpu_arch = Some("arm64".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4");
+        assert_eq!(placement.machine_family, "c4a");
+        assert_eq!(placement.arch, "arm64");
+    }
+
+    /// Rows written before the trigger could ask for an architecture.
+    #[test]
+    fn placement_accepts_the_legacy_x86_64_alias() {
+        let mut job = test_job();
+        job.cpu_arch = Some("x86_64".into());
+        let placement = Placement::resolve(&job, "12", "65Gi", "c4a");
+        assert_eq!(placement.machine_family, "c4");
+        assert_eq!(placement.arch, "amd64");
+    }
+
+    #[test]
+    fn shard_timeout_identifies_the_independent_worker() {
+        let mut job = test_job();
+        job.effective_shards = 4;
+        job.shard_index = 2;
+        job.assignment_version = Some(crate::sharding::ASSIGNMENT_VERSION.into());
+        let body = terminal_failure_comment_body(7200, None, &job, "DeadlineExceeded", "", "");
+        assert!(body.contains("shard 3/4"));
+        assert!(body.contains("7200s job deadline"));
+    }
+
+    #[test]
+    fn terminal_failure_comment_includes_non_deadline_reason_and_message() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "Pod runner exited with status 1",
+            "",
+        );
+
+        assert!(body.contains("failed before finishing"));
+        assert!(body.contains("BackoffLimitExceeded"));
+        assert!(body.contains("Pod runner exited with status 1"));
+    }
+
+    /// The Kubernetes reason never names a cause, so the runner's own log tail
+    /// is what makes the comment actionable. It leads the details, ahead of the
+    /// Kubernetes message.
+    #[test]
+    fn terminal_failure_comment_quotes_the_runner_log() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "Job has reached the specified backoff limit",
+            "error: target `multi_group_by` in package `datafusion-physical-plan` requires the features: `test_utils`",
+        );
+
+        assert!(body.contains("<details><summary>Runner log (last 40 lines)</summary>"));
+        assert!(body.contains("requires the features: `test_utils`"));
+        assert!(
+            body.find("Runner log").unwrap() < body.find("Kubernetes message").unwrap(),
+            "the cause should come before the Kubernetes reason"
+        );
+    }
+
+    /// An unreadable pod log drops the section rather than the notification.
+    #[test]
+    fn terminal_failure_comment_omits_an_empty_runner_log() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "Job has reached the specified backoff limit",
+            "",
+        );
+
+        assert!(!body.contains("Runner log"));
+        assert!(body.contains("Kubernetes message"));
+    }
+
+    /// A log tail is pod output, so it gets the same fence widening as the
+    /// Kubernetes message: a benchmark that prints a fence cannot break out of
+    /// the block and inject Markdown into the comment.
+    #[test]
+    fn terminal_failure_comment_uses_safe_fence_for_runner_log() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "",
+            "runner output:\n```\nuntrusted markdown\n```",
+        );
+
+        assert!(body.contains("````\nrunner output:\n```\nuntrusted markdown\n```\n````"));
+    }
+
+    #[test]
+    fn deadline_exceeded_comment_keeps_existing_text() {
+        let body =
+            terminal_failure_comment_body(7200, None, &test_job(), "DeadlineExceeded", "", "");
+
+        assert_eq!(
+            body,
+            "Benchmark for [this request](https://github.com/apache/datafusion/pull/42#issuecomment-123) hit the 7200s job deadline before finishing.\n\nBenchmarks requested: `tpch`"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_comment_uses_safe_fence_for_kubernetes_message() {
+        let body = terminal_failure_comment_body(
+            7200,
+            None,
+            &test_job(),
+            "BackoffLimitExceeded",
+            "pod output:\n```\nuntrusted markdown\n```",
+            "",
+        );
+
+        assert!(body.contains("````\npod output:\n```\nuntrusted markdown\n```\n````"));
     }
 }
