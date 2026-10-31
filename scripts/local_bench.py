@@ -1359,7 +1359,22 @@ def main(args: SimpleNamespace) -> int:
     print(report_text.rstrip())
     print("=" * 78)
     log(f"Markdown report: {out_path}")
-    return 1 if changed.failures else 0
+    if changed.failures:
+        return 1
+    if not args.no_open:
+        open_report(out_path)
+    return 0
+
+
+def open_report(path: Path) -> None:
+    """Open the report in vi, when there is a terminal to run it in."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        log("Not a terminal; not opening the report in vi")
+        return
+    if not shutil.which("vi"):
+        warn("vi not found; not opening the report")
+        return
+    subprocess.run(["vi", str(path)])
 
 
 _TARGETS_CACHE: dict[Path, dict[str, list[str]]] = {}
@@ -1569,6 +1584,13 @@ def cli(
         typer.Option(
             "--clean-after",
             help="Delete the worktrees' target dirs once the report is written.",
+        ),
+    ] = False,
+    no_open: Annotated[
+        bool,
+        typer.Option(
+            "--no-open",
+            help="Do not open the Markdown report in vi after a successful run.",
         ),
     ] = False,
     dry_run: Annotated[
