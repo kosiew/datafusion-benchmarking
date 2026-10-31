@@ -1,16 +1,17 @@
-#!/usr/bin/env python3
+#!/Users/kosiew/GitHub/scripts_venv/.venv/bin/python3
 """Run DataFusion benchmarks locally, comparing a baseline against a changed
 checkout, and produce a report shaped like the one the GKE runner posts on PRs
 (see controller/src/runner/bench_datafusion.rs).
 
+\b
 Pipeline (mirrors the runner):
-
     local datafusion repo
       ├── worktree  <workdir>/baseline   (merge-base | --baseline-ref | --baseline-branch)
       ├── worktree  <workdir>/changed    (HEAD | --changed-ref | --changed-branch | --changed-in-place)
       └── worktree  <workdir>/harness    (bench.sh + compare.py from <upstream>/main)
                      benchmarks/queries ──symlink──► each side's own queries while it runs
 
+\b
 For each requested benchmark:
   * a Criterion `[[bench]]` target  → `cargo bench --bench <name> -- --save-baseline <side>`
   * tpch / tpch10 / tpch_mem / tpch_mem10 → prebuilt `dfbench tpch` directly
@@ -18,8 +19,8 @@ For each requested benchmark:
 Then `bench.sh compare` (min), `bench.sh compare_detail` (mean ±stddev) and
 `critcmp` are run over whatever artifacts each side produced.
 
+\b
 The benchmark command can be given in any of these forms:
-
     local_bench.py tpch_mem clickbench_partitioned        # benchmark names
     local_bench.py run benchmarks tpch_mem                # trigger-comment form
     local_bench.py ./bench.sh run tpch_mem 5              # bench.sh form (query 5)
@@ -31,14 +32,15 @@ DATA_DIR, RESULTS_DIR and CARGO_TARGET_DIR set; `{results_name}`, `{side_dir}`,
 `{results_dir}` and `{data_dir}` placeholders are substituted. A `cargo bench`
 command without `--save-baseline` gets `--save-baseline <side>` appended.
 
-Options must come before the benchmark command. Only the Python standard
-library is needed. bench.sh's compare step needs `uv`,
-Criterion comparison needs `critcmp` (`cargo install critcmp`).
+Options must come before the benchmark command; everything after it is passed
+through verbatim (including `--`). Runs with the scripts venv
+(/Users/kosiew/GitHub/scripts_venv/.venv/bin/python3), which provides Typer and
+Rich. bench.sh's compare step needs `uv`, Criterion comparison needs `critcmp`
+(`cargo install critcmp`).
 """
 
 from __future__ import annotations
 
-import argparse
 import datetime as dt
 import json
 import os
@@ -49,8 +51,24 @@ import shutil
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Annotated, Iterator, Optional
+
+import typer
+from rich.console import Console
+from rich.markup import escape
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.text import Text
 
 BASE_LABEL = "baseline"
 CHANGED_LABEL = "changed"
@@ -87,12 +105,85 @@ sys.exit(rc)
 # ---------------------------------------------------------------------------
 
 
+class UI:
+    """Progress display on stderr: an overall bar plus one spinner line per
+    running command (two at once during parallel builds). Benchmark output and
+    log messages are printed above the live display."""
+
+    def __init__(self) -> None:
+        self.console = Console(stderr=True, highlight=False)
+        self.progress: Progress | None = None
+        self.overall: TaskID | None = None
+        self.lock = threading.Lock()
+
+    def start(self, total: int) -> None:
+        self.progress = Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(bar_width=24),
+            TextColumn("{task.fields[count]}"),
+            TimeElapsedColumn(),
+            TextColumn("[dim]{task.fields[detail]}"),
+            console=self.console,
+        )
+        self.progress.start()
+        self.overall = self.progress.add_task(
+            "[bold]Overall", total=total, count=f"0/{total}", detail=""
+        )
+
+    def set_total(self, total: int) -> None:
+        if self.progress and self.overall is not None:
+            done = int(self.progress.tasks[self.overall].completed)
+            self.progress.update(self.overall, total=total, count=f"{done}/{total}")
+
+    def advance(self) -> None:
+        if not self.progress or self.overall is None:
+            return
+        with self.lock:
+            self.progress.advance(self.overall)
+            t = self.progress.tasks[self.overall]
+            total = int(t.total or 0)
+            done = min(int(t.completed), total)
+            self.progress.update(self.overall, count=f"{done}/{total}")
+
+    def stop(self) -> None:
+        if self.progress:
+            self.progress.stop()
+            self.progress = None
+
+    def print(self, renderable: object) -> None:
+        self.console.print(renderable)
+
+    @contextmanager
+    def step(self, label: str) -> Iterator[TaskID | None]:
+        """A spinner line for one step; advances the overall bar when done."""
+        if not self.progress:
+            yield None
+            return
+        tid = self.progress.add_task(label, total=None, count="", detail="")
+        try:
+            yield tid
+        finally:
+            self.progress.remove_task(tid)
+            self.advance()
+
+    def detail(self, tid: TaskID | None, text: str) -> None:
+        if self.progress and tid is not None:
+            text = text.strip()
+            if len(text) > 70:
+                text = text[:67] + "..."
+            self.progress.update(tid, detail=escape(text))
+
+
+ui = UI()
+
+
 def log(msg: str) -> None:
-    print(f"\033[1;34m==>\033[0m {msg}", file=sys.stderr, flush=True)
+    ui.print(Text.assemble(("==> ", "bold blue"), msg))
 
 
 def warn(msg: str) -> None:
-    print(f"\033[1;33mwarning:\033[0m {msg}", file=sys.stderr, flush=True)
+    ui.print(Text.assemble(("warning: ", "bold yellow"), msg))
 
 
 class CommandError(RuntimeError):
@@ -149,11 +240,24 @@ def run_logged(
     env_overrides: dict[str, str],
     log_path: Path,
     quiet: bool,
+    label: str | None = None,
 ) -> RunStats:
     """Run a long command, teeing output to `log_path`, and measure it."""
     log(show(cmd, cwd, env_overrides))
     if DRY_RUN:
         return RunStats()
+    with ui.step(label or log_path.stem) as tid:
+        return _run_logged(cmd, cwd, env_overrides, log_path, quiet, tid)
+
+
+def _run_logged(
+    cmd: list[str],
+    cwd: Path,
+    env_overrides: dict[str, str],
+    log_path: Path,
+    quiet: bool,
+    tid: TaskID | None,
+) -> RunStats:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path = log_path.with_suffix(".rusage.json")
     full = [sys.executable, "-c", RUSAGE_WRAPPER, str(stats_path), *cmd]
@@ -171,8 +275,10 @@ def run_logged(
         assert proc.stdout is not None
         for line in proc.stdout:
             lf.write(line)
+            if line.strip():
+                ui.detail(tid, Text.from_ansi(line).plain)
             if not quiet:
-                sys.stdout.write(line)
+                ui.print(Text.from_ansi(line.rstrip("\n")))
         proc.wait()
     try:
         data = json.loads(stats_path.read_text())
@@ -554,117 +660,6 @@ def parse_env(pairs: list[str], flag: str) -> dict[str, str]:
     return env
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description=__doc__.split("\n\n")[0],
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="\n\n".join(__doc__.split("\n\n")[3:]),
-    )
-    p.add_argument(
-        "command", nargs=argparse.REMAINDER, help="benchmark command (see forms below)"
-    )
-    p.add_argument(
-        "--repo",
-        type=Path,
-        default=None,
-        help="local datafusion repo (default: $DATAFUSION_REPO, cwd if it is one, "
-        "else ~/GitHub/datafusion)",
-    )
-    p.add_argument(
-        "--workdir",
-        type=Path,
-        default=None,
-        help="where worktrees/logs/reports live (default: <repo>/../datafusion-bench-local)",
-    )
-    p.add_argument(
-        "--remote",
-        default=None,
-        help="remote holding upstream main (default: auto-detect apache/datafusion)",
-    )
-    p.add_argument(
-        "--no-fetch", action="store_true", help="do not git fetch before resolving refs"
-    )
-
-    b = p.add_argument_group(
-        "baseline (default: merge-base of changed and <remote>/main)"
-    )
-    bx = b.add_mutually_exclusive_group()
-    bx.add_argument(
-        "--baseline-ref", help="any git ref: sha, tag, local branch, remote/branch"
-    )
-    bx.add_argument(
-        "--baseline-branch", help="branch name, fetched from --remote first"
-    )
-
-    c = p.add_argument_group("changed side (default: HEAD of --repo)")
-    cx = c.add_mutually_exclusive_group()
-    cx.add_argument("--changed-ref", help="any git ref")
-    cx.add_argument("--changed-branch", help="branch name, fetched from --remote first")
-    cx.add_argument(
-        "--changed-in-place",
-        action="store_true",
-        help="benchmark the repo's working tree as-is (includes uncommitted changes, "
-        "reuses its target dir)",
-    )
-
-    r = p.add_argument_group("run options")
-    r.add_argument(
-        "--raw", action="store_true", help="treat the command as a raw shell command"
-    )
-    r.add_argument("--query", help="single query for bench.sh suites (e.g. 5)")
-    r.add_argument("--bench-filter", default="", help="Criterion test-name filter")
-    r.add_argument(
-        "--harness-ref",
-        default=None,
-        help="ref providing bench.sh/compare.py (default: <remote>/main)",
-    )
-    r.add_argument(
-        "--data-dir",
-        type=Path,
-        default=None,
-        help="benchmark data dir, shared by all runs (default: <repo>/benchmarks/data)",
-    )
-    r.add_argument(
-        "--skip-data", action="store_true", help="skip `bench.sh data <bench>`"
-    )
-    r.add_argument(
-        "--env", action="append", default=[], metavar="K=V", help="env for both sides"
-    )
-    r.add_argument("--baseline-env", action="append", default=[], metavar="K=V")
-    r.add_argument("--changed-env", action="append", default=[], metavar="K=V")
-    r.add_argument(
-        "--no-thin-lto",
-        action="store_true",
-        help="keep DataFusion's fat LTO (the GKE runner forces thin)",
-    )
-    r.add_argument(
-        "--jobs",
-        type=int,
-        default=1,
-        help="CARGO_BUILD_JOBS (default: 1 to avoid OOM; GKE runner uses 5)",
-    )
-    r.add_argument(
-        "--sequential-build",
-        action="store_true",
-        help="build dfbench for the two sides one after another",
-    )
-    r.add_argument(
-        "--changed-first",
-        action="store_true",
-        help="run the changed side before the baseline for each benchmark",
-    )
-    r.add_argument(
-        "--output", type=Path, help="report path (default: <workdir>/reports/<ts>.md)"
-    )
-    r.add_argument(
-        "--quiet", action="store_true", help="only write benchmark output to log files"
-    )
-    r.add_argument(
-        "--dry-run", action="store_true", help="print the plan and commands only"
-    )
-    return p
-
-
 def default_repo() -> Path:
     if os.environ.get("DATAFUSION_REPO"):
         return Path(os.environ["DATAFUSION_REPO"])
@@ -675,11 +670,32 @@ def default_repo() -> Path:
     return Path.home() / "GitHub" / "datafusion"
 
 
-def main() -> int:
+def count_steps(plan: Plan, targets: dict[str, list[str]], skip_data: bool) -> int:
+    """Commands `main` will run (one progress step each), plus compare/report."""
+    if plan.raw:
+        return 2 + 1
+    steps = 2 if any(b not in targets for b in plan.benches) else 0  # dfbench builds
+    for bench in plan.benches:
+        if bench in targets:
+            steps += 0 if skip_data else len(CRITERION_DATASETS.get(bench, []))
+        else:
+            steps += 0 if skip_data else 1
+        steps += 2
+    return steps + 1
+
+
+def main(args: SimpleNamespace) -> int:
     global DRY_RUN
-    args = build_parser().parse_args()
     DRY_RUN = args.dry_run
-    plan = parse_command(args.command, args.raw, args.query)
+    plan = parse_command(args.command or [], args.raw, args.query)
+    exclusive = (
+        ("--baseline-ref", "--baseline-branch"),
+        ("--changed-ref", "--changed-branch", "--changed-in-place"),
+    )
+    for group in exclusive:
+        given = [o for o in group if getattr(args, o[2:].replace("-", "_"))]
+        if len(given) > 1:
+            raise SystemExit(f"error: {' and '.join(given)} are mutually exclusive")
 
     repo = (args.repo or default_repo()).expanduser().resolve()
     if not (repo / "benchmarks" / "bench.sh").exists():
@@ -779,10 +795,13 @@ def main() -> int:
             "baseline and changed are the same commit (A/A run: differences are noise)"
         )
 
-    prepare_worktree(repo, base.dir, base_sha)
-    if not args.changed_in_place:
-        prepare_worktree(repo, changed.dir, changed_sha)
-    prepare_worktree(repo, harness, harness_sha)
+    if not DRY_RUN:
+        ui.start(total=count_steps(plan, {}, args.skip_data) + 1)
+    with ui.step("Preparing worktrees"):
+        prepare_worktree(repo, base.dir, base_sha)
+        if not args.changed_in_place:
+            prepare_worktree(repo, changed.dir, changed_sha)
+        prepare_worktree(repo, harness, harness_sha)
     main_queries = prepare_harness_queries(harness_bench)
     if not DRY_RUN:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -841,6 +860,7 @@ def main() -> int:
                     env,
                     logs / f"raw-{s.name}.log",
                     args.quiet,
+                    label=f"Running command on [bold]{s.name}[/]",
                 )
                 s.stats.append(("raw", st))
             except CommandError as e:
@@ -850,6 +870,7 @@ def main() -> int:
     else:
         requested = plan.benches
         targets = criterion_targets_cache(changed)
+        ui.set_total(count_steps(plan, targets, args.skip_data) + 1)
         shell_benches = [b for b in requested if b not in targets]
 
         if shell_benches:
@@ -868,6 +889,7 @@ def main() -> int:
                         side_env(s),
                         logs / f"build-{s.name}.log",
                         quiet=not args.sequential_build or args.quiet,
+                        label=f"Building dfbench ([bold]{s.name}[/])",
                     )
                 except CommandError as e:
                     errors[s.name] = str(e)
@@ -906,6 +928,7 @@ def main() -> int:
                             },
                             logs / f"data-{ds}.log",
                             args.quiet,
+                            label=f"Generating data {ds}",
                         )
                     # Criterion targets read <checkout>/benchmarks/data.
                     for s in (base, changed):
@@ -936,6 +959,7 @@ def main() -> int:
                             side_env(s),
                             logs / f"{bench}-{s.name}.log",
                             args.quiet,
+                            label=f"{bench} on [bold]{s.name}[/] (criterion)",
                         )
                         s.stats.append((bench, st))
                         s.criterion_ran = True
@@ -961,6 +985,7 @@ def main() -> int:
                         },
                         logs / f"data-{bench}.log",
                         args.quiet,
+                        label=f"Generating data for {bench}",
                     )
                 except CommandError as e:
                     warn(f"data generation for {bench} failed: {e}")
@@ -1010,7 +1035,12 @@ def main() -> int:
                     cwd = harness_bench
                 try:
                     st = run_logged(
-                        cmd, cwd, env, logs / f"{bench}-{s.name}.log", args.quiet
+                        cmd,
+                        cwd,
+                        env,
+                        logs / f"{bench}-{s.name}.log",
+                        args.quiet,
+                        label=f"{bench} on [bold]{s.name}[/]",
                     )
                     s.stats.append((bench, st))
                 except CommandError as e:
@@ -1023,66 +1053,67 @@ def main() -> int:
         return 0
 
     # --- compare -----------------------------------------------------------
-    report: list[str] = []
-    base_results = results_dir(harness_bench, base)
-    if results_json_files(base_results) and results_json_files(
-        results_dir(harness_bench, changed)
-    ):
-        if not shutil.which("uv"):
-            report.append("`uv` not found: bench.sh compare skipped\n")
-        else:
-            summary = run(
-                ["./bench.sh", "compare", base.name, changed.name],
-                harness_bench,
-                check=False,
-            )
-            detail = run(
-                ["./bench.sh", "compare_detail", base.name, changed.name],
-                harness_bench,
-                check=False,
-            )
-            report.append(summary)
-            report.append(
-                "\nDistribution per query (min / mean ±stddev / max):\n\n" + detail
-            )
-
-    base_crit = has_criterion_baseline(base.target_dir, base.name)
-    changed_crit = has_criterion_baseline(changed.target_dir, changed.name)
-    if changed_crit:
-        if not shutil.which("critcmp"):
-            report.append(
-                "\n`critcmp` not found (cargo install critcmp): Criterion comparison skipped\n"
-            )
-        else:
-            exports = workdir / "criterion-exports" / run_id
-            exports.mkdir(parents=True, exist_ok=True)
-            files = []
-            for s, ok in ((base, base_crit), (changed, changed_crit)):
-                if not ok:
-                    continue
-                f = exports / f"{s.name}.json"
-                f.write_text(
-                    run(
-                        [
-                            "critcmp",
-                            "--target-dir",
-                            str(s.target_dir),
-                            "--export",
-                            s.name,
-                        ],
-                        s.dir,
-                    )
+    with ui.step("Comparing results"):
+        report: list[str] = []
+        base_results = results_dir(harness_bench, base)
+        if results_json_files(base_results) and results_json_files(
+            results_dir(harness_bench, changed)
+        ):
+            if not shutil.which("uv"):
+                report.append("`uv` not found: bench.sh compare skipped\n")
+            else:
+                summary = run(
+                    ["./bench.sh", "compare", base.name, changed.name],
+                    harness_bench,
+                    check=False,
                 )
-                files.append(str(f))
-            out = run(["critcmp", *files], workdir, check=False)
-            prefix = (
-                ""
-                if base_crit
-                else "New benchmark — changed-only Criterion results:\n\n"
-            )
-            report.append(("\n" if report else "") + prefix + out)
+                detail = run(
+                    ["./bench.sh", "compare_detail", base.name, changed.name],
+                    harness_bench,
+                    check=False,
+                )
+                report.append(summary)
+                report.append(
+                    "\nDistribution per query (min / mean ±stddev / max):\n\n" + detail
+                )
 
-    report_text = "".join(report) or "No comparable results were produced.\n"
+        base_crit = has_criterion_baseline(base.target_dir, base.name)
+        changed_crit = has_criterion_baseline(changed.target_dir, changed.name)
+        if changed_crit:
+            if not shutil.which("critcmp"):
+                report.append(
+                    "\n`critcmp` not found (cargo install critcmp): Criterion comparison skipped\n"
+                )
+            else:
+                exports = workdir / "criterion-exports" / run_id
+                exports.mkdir(parents=True, exist_ok=True)
+                files = []
+                for s, ok in ((base, base_crit), (changed, changed_crit)):
+                    if not ok:
+                        continue
+                    f = exports / f"{s.name}.json"
+                    f.write_text(
+                        run(
+                            [
+                                "critcmp",
+                                "--target-dir",
+                                str(s.target_dir),
+                                "--export",
+                                s.name,
+                            ],
+                            s.dir,
+                        )
+                    )
+                    files.append(str(f))
+                out = run(["critcmp", *files], workdir, check=False)
+                prefix = (
+                    ""
+                    if base_crit
+                    else "New benchmark — changed-only Criterion results:\n\n"
+                )
+                report.append(("\n" if report else "") + prefix + out)
+
+        report_text = "".join(report) or "No comparable results were produced.\n"
 
     # --- assemble markdown -------------------------------------------------
     machine, cpu_details = machine_info()
@@ -1173,6 +1204,7 @@ def main() -> int:
     out_path = args.output or workdir / "reports" / f"{run_id}.md"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(md))
+    ui.stop()
 
     print("\n" + "=" * 78)
     print(report_text.rstrip())
@@ -1191,11 +1223,214 @@ def criterion_targets_cache(side: Side) -> dict[str, list[str]]:
     return _TARGETS_CACHE[key]
 
 
-if __name__ == "__main__":
+app = typer.Typer(
+    add_completion=False,
+    rich_markup_mode=None,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
+
+BASELINE = "Baseline (default: merge-base of changed and <remote>/main)"
+CHANGED = "Changed side (default: HEAD of --repo)"
+RUN = "Run options"
+
+
+@app.command(
+    help=__doc__,
+    context_settings={
+        # Everything after the first positional token is the benchmark command,
+        # passed through verbatim (`cargo bench ... -- --flag` included).
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+        "allow_interspersed_args": False,
+    },
+)
+def cli(
+    command: Annotated[
+        Optional[list[str]],
+        typer.Argument(help="Benchmark command (see forms above).", show_default=False),
+    ] = None,
+    repo: Annotated[
+        Optional[Path],
+        typer.Option(
+            help="Local datafusion repo (default: $DATAFUSION_REPO, cwd if it is "
+            "one, else ~/GitHub/datafusion)."
+        ),
+    ] = None,
+    workdir: Annotated[
+        Optional[Path],
+        typer.Option(
+            help="Where worktrees/logs/reports live "
+            "(default: <repo>/../datafusion-bench-local)."
+        ),
+    ] = None,
+    remote: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Remote holding upstream main (default: auto-detect apache/datafusion)."
+        ),
+    ] = None,
+    no_fetch: Annotated[
+        bool, typer.Option("--no-fetch", help="Do not git fetch before resolving refs.")
+    ] = False,
+    baseline_ref: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Any git ref: sha, tag, local branch, remote/branch.",
+            rich_help_panel=BASELINE,
+        ),
+    ] = None,
+    baseline_branch: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Branch name, fetched from --remote first.", rich_help_panel=BASELINE
+        ),
+    ] = None,
+    changed_ref: Annotated[
+        Optional[str], typer.Option(help="Any git ref.", rich_help_panel=CHANGED)
+    ] = None,
+    changed_branch: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Branch name, fetched from --remote first.", rich_help_panel=CHANGED
+        ),
+    ] = None,
+    changed_in_place: Annotated[
+        bool,
+        typer.Option(
+            "--changed-in-place",
+            help="Benchmark the repo's working tree as-is (includes uncommitted "
+            "changes, reuses its target dir).",
+            rich_help_panel=CHANGED,
+        ),
+    ] = False,
+    raw: Annotated[
+        bool,
+        typer.Option(
+            "--raw",
+            help="Treat the command as a raw shell command.",
+            rich_help_panel=RUN,
+        ),
+    ] = False,
+    query: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Single query for bench.sh suites (e.g. 5).", rich_help_panel=RUN
+        ),
+    ] = None,
+    bench_filter: Annotated[
+        str, typer.Option(help="Criterion test-name filter.", rich_help_panel=RUN)
+    ] = "",
+    harness_ref: Annotated[
+        Optional[str],
+        typer.Option(
+            help="Ref providing bench.sh/compare.py (default: <remote>/main).",
+            rich_help_panel=RUN,
+        ),
+    ] = None,
+    data_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            help="Benchmark data dir, shared by all runs "
+            "(default: <repo>/benchmarks/data).",
+            rich_help_panel=RUN,
+        ),
+    ] = None,
+    skip_data: Annotated[
+        bool,
+        typer.Option(
+            "--skip-data", help="Skip `bench.sh data <bench>`.", rich_help_panel=RUN
+        ),
+    ] = False,
+    env: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            metavar="K=V", help="Env for both sides (repeatable).", rich_help_panel=RUN
+        ),
+    ] = None,
+    baseline_env: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            metavar="K=V", help="Env for the baseline only.", rich_help_panel=RUN
+        ),
+    ] = None,
+    changed_env: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            metavar="K=V", help="Env for the changed side only.", rich_help_panel=RUN
+        ),
+    ] = None,
+    no_thin_lto: Annotated[
+        bool,
+        typer.Option(
+            "--no-thin-lto",
+            help="Keep DataFusion's fat LTO (the GKE runner forces thin).",
+            rich_help_panel=RUN,
+        ),
+    ] = False,
+    jobs: Annotated[
+        int,
+        typer.Option(
+            help="CARGO_BUILD_JOBS (1 avoids OOM; the GKE runner uses 5).",
+            rich_help_panel=RUN,
+        ),
+    ] = 1,
+    sequential_build: Annotated[
+        bool,
+        typer.Option(
+            "--sequential-build",
+            help="Build dfbench for the two sides one after another.",
+            rich_help_panel=RUN,
+        ),
+    ] = False,
+    changed_first: Annotated[
+        bool,
+        typer.Option(
+            "--changed-first",
+            help="Run the changed side before the baseline for each benchmark.",
+            rich_help_panel=RUN,
+        ),
+    ] = False,
+    output: Annotated[
+        Optional[Path],
+        typer.Option(
+            help="Report path (default: <workdir>/reports/<ts>.md).",
+            rich_help_panel=RUN,
+        ),
+    ] = None,
+    quiet: Annotated[
+        bool,
+        typer.Option(
+            "--quiet",
+            help="Only write benchmark output to log files (progress still shown).",
+            rich_help_panel=RUN,
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run", help="Print the plan and commands only.", rich_help_panel=RUN
+        ),
+    ] = False,
+) -> None:
+    args = SimpleNamespace(**locals())
+    args.env, args.baseline_env, args.changed_env = (
+        env or [],
+        baseline_env or [],
+        changed_env or [],
+    )
     try:
-        sys.exit(main())
+        code = main(args)
     except CommandError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
+        ui.stop()
+        ui.print(Text.assemble(("error: ", "bold red"), str(e)))
+        code = 1
     except KeyboardInterrupt:
-        sys.exit(130)
+        ui.stop()
+        code = 130
+    finally:
+        ui.stop()
+    raise typer.Exit(code)
+
+
+if __name__ == "__main__":
+    app()
