@@ -74,6 +74,7 @@ from rich.text import Text
 
 BASE_LABEL = "baseline"
 CHANGED_LABEL = "changed"
+BENCHMARK_SIDE_NAMES = (BASE_LABEL, CHANGED_LABEL)
 WORKLOAD_DIRS = ("benchmarks/queries", "benchmarks/sql_benchmarks")
 TPCH_DIRECT = {
     # name: (scale factor, in memory)
@@ -793,15 +794,489 @@ def ensure_falsa(harness_bench: Path, env: dict[str, str]) -> None:
 def count_steps(plan: Plan, targets: dict[str, list[str]], skip_data: bool) -> int:
     """Commands `main` will run (one progress step each), plus compare/report."""
     if plan.raw:
-        return 2 + 1
-    steps = 2 if any(b not in targets for b in plan.benches) else 0  # dfbench builds
+        return len(BENCHMARK_SIDE_NAMES) + 1
+    steps = (
+        len(BENCHMARK_SIDE_NAMES)
+        if any(b not in targets for b in plan.benches)
+        else 0
+    )  # dfbench builds
     for bench in plan.benches:
         if bench in targets:
             steps += 0 if skip_data else len(CRITERION_DATASETS.get(bench, []))
         else:
             steps += 0 if skip_data else 1 + bench.startswith("h2o")
-        steps += 2
+        steps += len(BENCHMARK_SIDE_NAMES)
     return steps + 1
+
+
+@dataclass
+class BenchmarkContext:
+    args: SimpleNamespace
+    plan: Plan
+    repo: Path
+    workdir: Path
+    data_dir: Path
+    base: Side
+    changed: Side
+    harness_bench: Path
+    main_queries: Path
+    shared_env: dict[str, str]
+    forced: dict[str, str]
+    run_id: str
+    logs: Path
+    harness_ref: str
+    harness_sha: str
+
+    @property
+    def order(self) -> list[Side]:
+        return (
+            [self.changed, self.base]
+            if self.args.changed_first
+            else [self.base, self.changed]
+        )
+
+    def side_env(
+        self, side: Side, extra: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        # Order matters: user env first, then runner-controlled values.
+        return {
+            **side.env,
+            "CARGO_TARGET_DIR": str(side.target_dir),
+            **(extra or {}),
+            **self.forced,
+        }
+
+
+def run_benchmarks(context: BenchmarkContext) -> list[str]:
+    args, plan = context.args, context.plan
+    base, changed = context.base, context.changed
+    harness_bench, main_queries = context.harness_bench, context.main_queries
+    data_dir, forced, logs = context.data_dir, context.forced, context.logs
+    side_env, order = context.side_env, context.order
+
+    if plan.raw:
+        for side in order:
+            rdir = results_dir(harness_bench, side)
+            subs = {
+                "results_name": side.name,
+                "side_dir": str(side.dir),
+                "results_dir": str(rdir),
+                "data_dir": str(data_dir),
+            }
+            cmd = plan.raw
+            for key, value in subs.items():
+                cmd = cmd.replace("{" + key + "}", value)
+            if "cargo bench" in cmd and "--save-baseline" not in cmd:
+                cmd += (
+                    f" --save-baseline {side.name}"
+                    if " -- " in cmd
+                    else f" -- --save-baseline {side.name}"
+                )
+            env = side_env(
+                side,
+                {
+                    "SIDE": side.name,
+                    "RESULTS_NAME": side.name,
+                    "DATAFUSION_DIR": str(side.dir),
+                    "DATA_DIR": str(data_dir),
+                    "RESULTS_DIR": str(rdir),
+                },
+            )
+            try:
+                stats = run_logged(
+                    ["bash", "-c", cmd],
+                    side.dir,
+                    env,
+                    logs / f"raw-{side.name}.log",
+                    args.quiet,
+                    label=f"Running command on [bold]{side.name}[/]",
+                )
+                side.stats.append(("raw", stats))
+            except CommandError as error:
+                side.failures.append(("raw", str(error)))
+                warn(f"{side.name} failed: {error}")
+        return ["raw"]
+
+    requested = plan.benches
+    targets = criterion_targets_cache(changed)
+    ui.set_total(count_steps(plan, targets, args.skip_data) + 1)
+    shell_benches = [bench for bench in requested if bench not in targets]
+
+    if shell_benches:
+        build = ["cargo", "build", "--release", "--bin", "dfbench"]
+        log(
+            "Building dfbench for both sides"
+            + ("" if args.sequential_build else " in parallel")
+        )
+        errors: dict[str, str] = {}
+
+        def do_build(side: Side) -> None:
+            try:
+                run_logged(
+                    build,
+                    side.dir / "benchmarks",
+                    side_env(side),
+                    logs / f"build-{side.name}.log",
+                    quiet=not args.sequential_build or args.quiet,
+                    label=f"Building dfbench ([bold]{side.name}[/])",
+                )
+            except CommandError as error:
+                errors[side.name] = str(error)
+
+        if args.sequential_build or DRY_RUN:
+            for side in (base, changed):
+                do_build(side)
+        else:
+            threads = [
+                threading.Thread(target=do_build, args=(side,))
+                for side in (base, changed)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        if CHANGED_LABEL in errors:
+            raise SystemExit(
+                f"error: changed-side build failed: {errors[CHANGED_LABEL]}"
+            )
+        if BASE_LABEL in errors:
+            warn(f"baseline build failed: {errors[BASE_LABEL]}")
+
+    for bench in requested:
+        if bench in targets:
+            features = ["parquet"] + [f for f in targets[bench] if f != "parquet"]
+            if not args.skip_data:
+                for dataset in CRITERION_DATASETS.get(bench, []):
+                    point_queries(harness_bench, main_queries)
+                    run_logged(
+                        ["./bench.sh", "data", dataset],
+                        harness_bench,
+                        {
+                            "DATA_DIR": str(data_dir),
+                            "DATAFUSION_DIR": str(changed.dir),
+                        },
+                        logs / f"data-{dataset}.log",
+                        args.quiet,
+                        label=f"Generating data {dataset}",
+                    )
+                # Criterion targets read <checkout>/benchmarks/data.
+                for side in (base, changed):
+                    link = side.dir / "benchmarks" / "data"
+                    if (
+                        not link.exists()
+                        and not DRY_RUN
+                        and CRITERION_DATASETS.get(bench)
+                    ):
+                        link.symlink_to(data_dir)
+            for side in order:
+                cmd = [
+                    "cargo",
+                    "bench",
+                    f"--features={','.join(features)}",
+                    "--bench",
+                    bench,
+                    "--",
+                    "--save-baseline",
+                    side.name,
+                ]
+                if args.bench_filter:
+                    cmd.append(args.bench_filter)
+                try:
+                    stats = run_logged(
+                        cmd,
+                        side.dir,
+                        side_env(side),
+                        logs / f"{bench}-{side.name}.log",
+                        args.quiet,
+                        label=f"{bench} on [bold]{side.name}[/] (criterion)",
+                    )
+                    side.stats.append((bench, stats))
+                    side.criterion_ran = True
+                except CommandError as error:
+                    side.failures.append((bench, str(error)))
+                    warn(f"{bench} ({side.name}) failed: {error}")
+            continue
+
+        if not args.skip_data:
+            point_queries(harness_bench, main_queries)
+            data_bench = bench
+            if bench in TPCH_DIRECT:
+                data_bench = "tpch10" if TPCH_DIRECT[bench][0] == "10" else "tpch"
+            data_env = {
+                "DATA_DIR": str(data_dir),
+                "DATAFUSION_DIR": str(changed.dir),
+                "CARGO_TARGET_DIR": str(changed.target_dir),
+                **forced,
+                **DATA_GEN_ENV,
+            }
+            try:
+                if bench.startswith("h2o"):
+                    ensure_falsa(harness_bench, data_env)
+                run_logged(
+                    ["./bench.sh", "data", data_bench],
+                    harness_bench,
+                    data_env,
+                    logs / f"data-{bench}.log",
+                    args.quiet,
+                    label=f"Generating data for {bench}",
+                )
+            except CommandError as error:
+                # Running without its data only fails later, on both sides.
+                warn(f"data generation for {bench} failed, skipping it: {error}")
+                for side in (base, changed):
+                    side.failures.append(
+                        (bench, f"data generation failed: {error}")
+                    )
+                for _ in BENCHMARK_SIDE_NAMES:
+                    ui.advance()
+                continue
+
+        for side in order:
+            rdir = results_dir(harness_bench, side)
+            point_queries(harness_bench, side_queries(side, main_queries))
+            if bench in TPCH_DIRECT:
+                scale_factor, in_memory = TPCH_DIRECT[bench]
+                out = rdir / (
+                    f"tpch_mem_sf{scale_factor}.json"
+                    if in_memory
+                    else f"tpch_sf{scale_factor}.json"
+                )
+                cmd = [
+                    str(side.target_dir / "release" / "dfbench"),
+                    "tpch",
+                    "--iterations",
+                    "5",
+                    "--scale-factor",
+                    scale_factor,
+                    "--format",
+                    "parquet",
+                    "--prefer_hash_join",
+                    "true",
+                    "--path",
+                    str(data_dir / f"tpch_sf{scale_factor}"),
+                    "-o",
+                    str(out),
+                ]
+                if in_memory:
+                    cmd.append("-m")
+                if plan.query:
+                    cmd += ["--query", plan.query]
+                cwd, env = harness_bench, side_env(side)
+            else:
+                cmd = ["./bench.sh", "run", bench] + (
+                    [plan.query] if plan.query else []
+                )
+                env = side_env(
+                    side,
+                    {
+                        "DATAFUSION_DIR": str(side.dir),
+                        "RESULTS_NAME": side.name,
+                        "DATA_DIR": str(data_dir),
+                        "SQL_CARGO_COMMAND": (
+                            f"cargo bench --bench sql -- --save-baseline {side.name}"
+                        ),
+                    },
+                )
+                cwd = harness_bench
+            try:
+                stats = run_logged(
+                    cmd,
+                    cwd,
+                    env,
+                    logs / f"{bench}-{side.name}.log",
+                    args.quiet,
+                    label=f"{bench} on [bold]{side.name}[/]",
+                )
+                side.stats.append((bench, stats))
+            except CommandError as error:
+                side.failures.append((bench, str(error)))
+                warn(f"{bench} ({side.name}) failed: {error}")
+    point_queries(harness_bench, main_queries)
+    return requested
+
+
+def compare_results(context: BenchmarkContext) -> str:
+    base, changed = context.base, context.changed
+    harness_bench = context.harness_bench
+    with ui.step("Comparing results"):
+        report: list[str] = []
+        base_results = results_dir(harness_bench, base)
+        if results_json_files(base_results) and results_json_files(
+            results_dir(harness_bench, changed)
+        ):
+            if not shutil.which("uv"):
+                report.append("`uv` not found: bench.sh compare skipped\n")
+            else:
+                summary = run(
+                    ["./bench.sh", "compare", base.name, changed.name],
+                    harness_bench,
+                    check=False,
+                )
+                detail = run(
+                    ["./bench.sh", "compare_detail", base.name, changed.name],
+                    harness_bench,
+                    check=False,
+                )
+                report.append(summary)
+                report.append(
+                    "\nDistribution per query (min / mean ±stddev / max):\n\n"
+                    + detail
+                )
+
+        base_crit = has_criterion_baseline(base.target_dir, base.name)
+        changed_crit = has_criterion_baseline(changed.target_dir, changed.name)
+        if changed_crit:
+            if not shutil.which("critcmp"):
+                report.append(
+                    "\n`critcmp` not found (cargo install critcmp): Criterion "
+                    "comparison skipped\n"
+                )
+            else:
+                exports = context.workdir / "criterion-exports" / context.run_id
+                exports.mkdir(parents=True, exist_ok=True)
+                files = []
+                for side, ok in ((base, base_crit), (changed, changed_crit)):
+                    if not ok:
+                        continue
+                    path = exports / f"{side.name}.json"
+                    path.write_text(
+                        run(
+                            [
+                                "critcmp",
+                                "--target-dir",
+                                str(side.target_dir),
+                                "--export",
+                                side.name,
+                            ],
+                            side.dir,
+                        )
+                    )
+                    files.append(str(path))
+                out = run(["critcmp", *files], context.workdir, check=False)
+                prefix = (
+                    ""
+                    if base_crit
+                    else "New benchmark — changed-only Criterion results:\n\n"
+                )
+                report.append(("\n" if report else "") + prefix + out)
+        return "".join(report) or "No comparable results were produced.\n"
+
+
+def write_report(
+    context: BenchmarkContext, requested: list[str], report_text: str
+) -> Path:
+    args = context.args
+    repo, base, changed = context.repo, context.base, context.changed
+    harness_bench = context.harness_bench
+    machine, cpu_details = machine_info()
+    command = (
+        context.plan.raw
+        if context.plan.raw
+        else "run benchmarks " + " ".join(context.plan.benches)
+    )
+    config_yaml = [f"command: {command}"]
+    if context.plan.query:
+        config_yaml.append(f"query: {context.plan.query}")
+    if context.shared_env:
+        config_yaml.append("env:")
+        config_yaml += [
+            f"  {key}: {json.dumps(value)}"
+            for key, value in context.shared_env.items()
+        ]
+    for title, ref, extra in (
+        (
+            "baseline",
+            args.baseline_ref or args.baseline_branch,
+            args.baseline_env,
+        ),
+        ("changed", args.changed_ref or args.changed_branch, args.changed_env),
+    ):
+        if ref or extra:
+            config_yaml.append(f"{title}:")
+            if ref:
+                config_yaml.append(f"  ref: {json.dumps(ref)}")
+            if extra:
+                config_yaml.append("  env:")
+                config_yaml += [
+                    f"    {key}: {json.dumps(value)}"
+                    for key, value in parse_env(extra, title).items()
+                ]
+    if context.forced:
+        config_yaml.append(
+            "build: "
+            + " ".join(f"{key}={value}" for key, value in context.forced.items())
+        )
+
+    md = [
+        f"🤖 Benchmark completed (local) | {dt.datetime.now():%Y-%m-%d %H:%M}\n",
+        f"**Machine:** {machine}\n",
+        f"Comparing `{changed.label}` ({changed.sha[:7]}) "
+        f"to `{base.label}` ({base.sha[:7]})\n",
+        "<details><summary>Run configuration</summary>\n\n```yaml\n"
+        + "\n".join(config_yaml)
+        + "\n```\n\n</details>\n",
+    ]
+
+    workload: list[str] = []
+    if not context.plan.raw and any(
+        bench not in criterion_targets_cache(changed) for bench in requested
+    ):
+        workload.append(
+            f"**Workload:** `bench.sh` from `{context.harness_ref}` "
+            f"({context.harness_sha[:7]}); "
+            "each side runs its own query files.\n"
+        )
+    failures = [
+        (side, bench, error)
+        for side in (base, changed)
+        for bench, error in side.failures
+    ]
+    if failures:
+        workload.append("**Failures:**\n")
+        workload += [
+            f"- `{bench}` on **{side.name}**: {error.splitlines()[0]}"
+            for side, bench, error in failures
+        ]
+        workload.append("")
+    cov = coverage_section(
+        results_dir(harness_bench, base), results_dir(harness_bench, changed)
+    )
+    if cov:
+        workload.append("**Result coverage:**\n")
+        workload += cov + [""]
+    wd = workload_diff(repo, base, changed, args.changed_in_place)
+    if wd:
+        workload.append("**Workload files differing between sides:**\n")
+        workload += (
+            wd[:25] + ([f"- … and {len(wd) - 25} more"] if len(wd) > 25 else []) + [""]
+        )
+    if workload:
+        md.append("\n".join(workload))
+
+    if cpu_details:
+        md.append(
+            f"<details><summary>CPU Details</summary>\n\n```\n{cpu_details}"
+            "\n```\n\n</details>\n"
+        )
+    md.append(
+        f"<details><summary>Details</summary>\n<p>\n\n```\n"
+        f"{report_text.rstrip()}\n```\n\n</p>\n</details>\n"
+    )
+    pool = pool_section(harness_bench, base, changed)
+    if pool:
+        md.append(
+            f"<details><summary>Memory Pool Peaks</summary>\n\n{pool}\n</details>\n"
+        )
+    md.append(
+        "<details><summary>Resource Usage</summary>\n\n"
+        f"{resource_section([base, changed])}\n</details>\n"
+    )
+    md.append(f"_Logs: `{context.logs}`_\n")
+
+    out_path = args.output or context.workdir / "reports" / f"{context.run_id}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(md))
+    return out_path
 
 
 def main(args: SimpleNamespace) -> int:
@@ -950,407 +1425,31 @@ def main(args: SimpleNamespace) -> int:
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     logs = workdir / "logs" / run_id
 
-    def side_env(s: Side, extra: dict[str, str] | None = None) -> dict[str, str]:
-        # Order matters: user env first, then runner-controlled values.
-        return {
-            **s.env,
-            "CARGO_TARGET_DIR": str(s.target_dir),
-            **(extra or {}),
-            **forced,
-        }
-
-    order = [changed, base] if args.changed_first else [base, changed]
-
-    # --- run ---------------------------------------------------------------
-    if plan.raw:
-        for s in order:
-            rdir = results_dir(harness_bench, s)
-            subs = {
-                "results_name": s.name,
-                "side_dir": str(s.dir),
-                "results_dir": str(rdir),
-                "data_dir": str(data_dir),
-            }
-            cmd = plan.raw
-            for k, v in subs.items():
-                cmd = cmd.replace("{" + k + "}", v)
-            if "cargo bench" in cmd and "--save-baseline" not in cmd:
-                cmd += (
-                    f" --save-baseline {s.name}"
-                    if " -- " in cmd
-                    else f" -- --save-baseline {s.name}"
-                )
-            env = side_env(
-                s,
-                {
-                    "SIDE": s.name,
-                    "RESULTS_NAME": s.name,
-                    "DATAFUSION_DIR": str(s.dir),
-                    "DATA_DIR": str(data_dir),
-                    "RESULTS_DIR": str(rdir),
-                },
-            )
-            try:
-                st = run_logged(
-                    ["bash", "-c", cmd],
-                    s.dir,
-                    env,
-                    logs / f"raw-{s.name}.log",
-                    args.quiet,
-                    label=f"Running command on [bold]{s.name}[/]",
-                )
-                s.stats.append(("raw", st))
-            except CommandError as e:
-                s.failures.append(("raw", str(e)))
-                warn(f"{s.name} failed: {e}")
-        requested = ["raw"]
-    else:
-        requested = plan.benches
-        targets = criterion_targets_cache(changed)
-        ui.set_total(count_steps(plan, targets, args.skip_data) + 1)
-        shell_benches = [b for b in requested if b not in targets]
-
-        if shell_benches:
-            build = ["cargo", "build", "--release", "--bin", "dfbench"]
-            log(
-                "Building dfbench for both sides"
-                + ("" if args.sequential_build else " in parallel")
-            )
-            errors: dict[str, str] = {}
-
-            def do_build(s: Side) -> None:
-                try:
-                    run_logged(
-                        build,
-                        s.dir / "benchmarks",
-                        side_env(s),
-                        logs / f"build-{s.name}.log",
-                        quiet=not args.sequential_build or args.quiet,
-                        label=f"Building dfbench ([bold]{s.name}[/])",
-                    )
-                except CommandError as e:
-                    errors[s.name] = str(e)
-
-            if args.sequential_build or DRY_RUN:
-                for s in (base, changed):
-                    do_build(s)
-            else:
-                threads = [
-                    threading.Thread(target=do_build, args=(s,))
-                    for s in (base, changed)
-                ]
-                for t in threads:
-                    t.start()
-                for t in threads:
-                    t.join()
-            if CHANGED_LABEL in errors:
-                raise SystemExit(
-                    f"error: changed-side build failed: {errors[CHANGED_LABEL]}"
-                )
-            if BASE_LABEL in errors:
-                warn(f"baseline build failed: {errors[BASE_LABEL]}")
-
-        for bench in requested:
-            if bench in targets:
-                feats = ["parquet"] + [f for f in targets[bench] if f != "parquet"]
-                if not args.skip_data:
-                    for ds in CRITERION_DATASETS.get(bench, []):
-                        point_queries(harness_bench, main_queries)
-                        run_logged(
-                            ["./bench.sh", "data", ds],
-                            harness_bench,
-                            {
-                                "DATA_DIR": str(data_dir),
-                                "DATAFUSION_DIR": str(changed.dir),
-                            },
-                            logs / f"data-{ds}.log",
-                            args.quiet,
-                            label=f"Generating data {ds}",
-                        )
-                    # Criterion targets read <checkout>/benchmarks/data.
-                    for s in (base, changed):
-                        link = s.dir / "benchmarks" / "data"
-                        if (
-                            not link.exists()
-                            and not DRY_RUN
-                            and CRITERION_DATASETS.get(bench)
-                        ):
-                            link.symlink_to(data_dir)
-                for s in order:
-                    cmd = [
-                        "cargo",
-                        "bench",
-                        f"--features={','.join(feats)}",
-                        "--bench",
-                        bench,
-                        "--",
-                        "--save-baseline",
-                        s.name,
-                    ]
-                    if args.bench_filter:
-                        cmd.append(args.bench_filter)
-                    try:
-                        st = run_logged(
-                            cmd,
-                            s.dir,
-                            side_env(s),
-                            logs / f"{bench}-{s.name}.log",
-                            args.quiet,
-                            label=f"{bench} on [bold]{s.name}[/] (criterion)",
-                        )
-                        s.stats.append((bench, st))
-                        s.criterion_ran = True
-                    except CommandError as e:
-                        s.failures.append((bench, str(e)))
-                        warn(f"{bench} ({s.name}) failed: {e}")
-                continue
-
-            if not args.skip_data:
-                point_queries(harness_bench, main_queries)
-                data_bench = bench
-                if bench in TPCH_DIRECT:
-                    data_bench = "tpch10" if TPCH_DIRECT[bench][0] == "10" else "tpch"
-                data_env = {
-                    "DATA_DIR": str(data_dir),
-                    "DATAFUSION_DIR": str(changed.dir),
-                    "CARGO_TARGET_DIR": str(changed.target_dir),
-                    **forced,
-                    **DATA_GEN_ENV,
-                }
-                try:
-                    if bench.startswith("h2o"):
-                        ensure_falsa(harness_bench, data_env)
-                    run_logged(
-                        ["./bench.sh", "data", data_bench],
-                        harness_bench,
-                        data_env,
-                        logs / f"data-{bench}.log",
-                        args.quiet,
-                        label=f"Generating data for {bench}",
-                    )
-                except CommandError as e:
-                    # Running without its data only fails later, on both sides.
-                    warn(f"data generation for {bench} failed, skipping it: {e}")
-                    for s in (base, changed):
-                        s.failures.append((bench, f"data generation failed: {e}"))
-                    ui.advance()
-                    ui.advance()
-                    continue
-
-            for s in order:
-                rdir = results_dir(harness_bench, s)
-                point_queries(harness_bench, side_queries(s, main_queries))
-                if bench in TPCH_DIRECT:
-                    sf, mem = TPCH_DIRECT[bench]
-                    out = rdir / (
-                        f"tpch_mem_sf{sf}.json" if mem else f"tpch_sf{sf}.json"
-                    )
-                    cmd = [
-                        str(s.target_dir / "release" / "dfbench"),
-                        "tpch",
-                        "--iterations",
-                        "5",
-                        "--scale-factor",
-                        sf,
-                        "--format",
-                        "parquet",
-                        "--prefer_hash_join",
-                        "true",
-                        "--path",
-                        str(data_dir / f"tpch_sf{sf}"),
-                        "-o",
-                        str(out),
-                    ]
-                    if mem:
-                        cmd.append("-m")
-                    if plan.query:
-                        cmd += ["--query", plan.query]
-                    cwd, env = harness_bench, side_env(s)
-                else:
-                    cmd = ["./bench.sh", "run", bench] + (
-                        [plan.query] if plan.query else []
-                    )
-                    env = side_env(
-                        s,
-                        {
-                            "DATAFUSION_DIR": str(s.dir),
-                            "RESULTS_NAME": s.name,
-                            "DATA_DIR": str(data_dir),
-                            "SQL_CARGO_COMMAND": f"cargo bench --bench sql -- --save-baseline {s.name}",
-                        },
-                    )
-                    cwd = harness_bench
-                try:
-                    st = run_logged(
-                        cmd,
-                        cwd,
-                        env,
-                        logs / f"{bench}-{s.name}.log",
-                        args.quiet,
-                        label=f"{bench} on [bold]{s.name}[/]",
-                    )
-                    s.stats.append((bench, st))
-                except CommandError as e:
-                    s.failures.append((bench, str(e)))
-                    warn(f"{bench} ({s.name}) failed: {e}")
-        point_queries(harness_bench, main_queries)
+    context = BenchmarkContext(
+        args=args,
+        plan=plan,
+        repo=repo,
+        workdir=workdir,
+        data_dir=data_dir,
+        base=base,
+        changed=changed,
+        harness_bench=harness_bench,
+        main_queries=main_queries,
+        shared_env=shared_env,
+        forced=forced,
+        run_id=run_id,
+        logs=logs,
+        harness_ref=harness_ref,
+        harness_sha=harness_sha,
+    )
+    requested = run_benchmarks(context)
 
     if DRY_RUN:
         log("Dry run complete")
         return 0
 
-    # --- compare -----------------------------------------------------------
-    with ui.step("Comparing results"):
-        report: list[str] = []
-        base_results = results_dir(harness_bench, base)
-        if results_json_files(base_results) and results_json_files(
-            results_dir(harness_bench, changed)
-        ):
-            if not shutil.which("uv"):
-                report.append("`uv` not found: bench.sh compare skipped\n")
-            else:
-                summary = run(
-                    ["./bench.sh", "compare", base.name, changed.name],
-                    harness_bench,
-                    check=False,
-                )
-                detail = run(
-                    ["./bench.sh", "compare_detail", base.name, changed.name],
-                    harness_bench,
-                    check=False,
-                )
-                report.append(summary)
-                report.append(
-                    "\nDistribution per query (min / mean ±stddev / max):\n\n" + detail
-                )
-
-        base_crit = has_criterion_baseline(base.target_dir, base.name)
-        changed_crit = has_criterion_baseline(changed.target_dir, changed.name)
-        if changed_crit:
-            if not shutil.which("critcmp"):
-                report.append(
-                    "\n`critcmp` not found (cargo install critcmp): Criterion comparison skipped\n"
-                )
-            else:
-                exports = workdir / "criterion-exports" / run_id
-                exports.mkdir(parents=True, exist_ok=True)
-                files = []
-                for s, ok in ((base, base_crit), (changed, changed_crit)):
-                    if not ok:
-                        continue
-                    f = exports / f"{s.name}.json"
-                    f.write_text(
-                        run(
-                            [
-                                "critcmp",
-                                "--target-dir",
-                                str(s.target_dir),
-                                "--export",
-                                s.name,
-                            ],
-                            s.dir,
-                        )
-                    )
-                    files.append(str(f))
-                out = run(["critcmp", *files], workdir, check=False)
-                prefix = (
-                    ""
-                    if base_crit
-                    else "New benchmark — changed-only Criterion results:\n\n"
-                )
-                report.append(("\n" if report else "") + prefix + out)
-
-        report_text = "".join(report) or "No comparable results were produced.\n"
-
-    # --- assemble markdown -------------------------------------------------
-    machine, cpu_details = machine_info()
-    config_yaml = [
-        f"command: {plan.raw if plan.raw else 'run benchmarks ' + ' '.join(plan.benches)}"
-    ]
-    if plan.query:
-        config_yaml.append(f"query: {plan.query}")
-    if shared_env:
-        config_yaml.append("env:")
-        config_yaml += [f"  {k}: {json.dumps(v)}" for k, v in shared_env.items()]
-    for title, side, ref, extra in (
-        (
-            "baseline",
-            base,
-            args.baseline_ref or args.baseline_branch,
-            args.baseline_env,
-        ),
-        ("changed", changed, args.changed_ref or args.changed_branch, args.changed_env),
-    ):
-        if ref or extra:
-            config_yaml.append(f"{title}:")
-            if ref:
-                config_yaml.append(f"  ref: {json.dumps(ref)}")
-            if extra:
-                config_yaml.append("  env:")
-                config_yaml += [
-                    f"    {k}: {json.dumps(v)}"
-                    for k, v in parse_env(extra, title).items()
-                ]
-    if forced:
-        config_yaml.append("build: " + " ".join(f"{k}={v}" for k, v in forced.items()))
-
-    md = [
-        f"🤖 Benchmark completed (local) | {dt.datetime.now():%Y-%m-%d %H:%M}\n",
-        f"**Machine:** {machine}\n",
-        f"Comparing `{changed.label}` ({changed_sha[:7]}) to `{baseline_label}` ({base_sha[:7]})\n",
-        "<details><summary>Run configuration</summary>\n\n```yaml\n"
-        + "\n".join(config_yaml)
-        + "\n```\n\n</details>\n",
-    ]
-
-    workload: list[str] = []
-    if not plan.raw and any(
-        b not in criterion_targets_cache(changed) for b in requested
-    ):
-        workload.append(
-            f"**Workload:** `bench.sh` from `{harness_ref}` ({harness_sha[:7]}); "
-            "each side runs its own query files.\n"
-        )
-    failures = [(s, b, e) for s in (base, changed) for b, e in s.failures]
-    if failures:
-        workload.append("**Failures:**\n")
-        workload += [
-            f"- `{b}` on **{s.name}**: {e.splitlines()[0]}" for s, b, e in failures
-        ]
-        workload.append("")
-    cov = coverage_section(base_results, results_dir(harness_bench, changed))
-    if cov:
-        workload.append("**Result coverage:**\n")
-        workload += cov + [""]
-    wd = workload_diff(repo, base, changed, args.changed_in_place)
-    if wd:
-        workload.append("**Workload files differing between sides:**\n")
-        workload += (
-            wd[:25] + ([f"- … and {len(wd) - 25} more"] if len(wd) > 25 else []) + [""]
-        )
-    if workload:
-        md.append("\n".join(workload))
-
-    if cpu_details:
-        md.append(
-            f"<details><summary>CPU Details</summary>\n\n```\n{cpu_details}\n```\n\n</details>\n"
-        )
-    md.append(
-        f"<details><summary>Details</summary>\n<p>\n\n```\n{report_text.rstrip()}\n```\n\n</p>\n</details>\n"
-    )
-    pool = pool_section(harness_bench, base, changed)
-    if pool:
-        md.append(
-            f"<details><summary>Memory Pool Peaks</summary>\n\n{pool}\n</details>\n"
-        )
-    md.append(
-        f"<details><summary>Resource Usage</summary>\n\n{resource_section([base, changed])}\n</details>\n"
-    )
-    md.append(f"_Logs: `{logs}`_\n")
-
-    out_path = args.output or workdir / "reports" / f"{run_id}.md"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\n".join(md))
+    report_text = compare_results(context)
+    out_path = write_report(context, requested, report_text)
     ui.stop()
     if args.clean_after:
         clean_targets(workdir)
