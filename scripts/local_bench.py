@@ -8,7 +8,7 @@ Pipeline (mirrors the runner):
     local datafusion repo
       ├── worktree  <workdir>/baseline   (merge-base | --baseline-ref | --baseline-branch)
       ├── worktree  <workdir>/changed    (HEAD | --changed-ref | --changed-branch | --changed-in-place)
-      └── worktree  <workdir>/harness    (bench.sh + compare.py from <upstream>/main)
+      └── worktree  <workdir>/harness    (bench.sh + compare.py: --harness-ref | baseline ref | <upstream>/main)
                      benchmarks/queries ──symlink──► each side's own queries while it runs
 
 \b
@@ -331,6 +331,13 @@ def parse_command(tokens: list[str], force_raw: bool, query: str | None) -> Plan
         raise SystemExit("error: no benchmark command given")
     if force_raw:
         return Plan(raw=shlex.join(tokens) if len(tokens) > 1 else tokens[0])
+    # Click hands unknown options to the command; no command form starts with
+    # `-`, so this is a typo'd option, which would otherwise be silently ignored.
+    if tokens[0].startswith("-"):
+        raise SystemExit(
+            f"error: unknown option {tokens[0]!r} (see --help; use --raw for a "
+            "command starting with '-')"
+        )
 
     # A single quoted argument such as "run benchmarks tpch_mem" or a raw command.
     if len(tokens) == 1 and " " in tokens[0]:
@@ -400,9 +407,49 @@ def resolve_branch(
     raise SystemExit(f"error: branch {branch!r} not found locally or on {remote}")
 
 
+def disable_submodule_recursion() -> None:
+    """Make every git command this script starts (and those bench.sh starts)
+    ignore a global `submodule.recurse = true`.
+
+    With it, `worktree add`/`checkout` recurse into datafusion's submodules,
+    which inside a linked worktree leaves submodule `.git` files pointing at
+    `.git/worktrees/<name>/modules/...` dirs that were never populated, and every
+    later checkout fails with "could not reset submodule index". The benchmarks
+    do not need the submodules (the GKE runner never initializes them).
+    """
+    n = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
+    os.environ[f"GIT_CONFIG_KEY_{n}"] = "submodule.recurse"
+    os.environ[f"GIT_CONFIG_VALUE_{n}"] = "false"
+    os.environ["GIT_CONFIG_COUNT"] = str(n + 1)
+
+
+def repair_submodule_links(path: Path) -> None:
+    """Remove submodule `.git` files whose gitdir no longer exists (left behind
+    by an earlier recursive checkout), so git treats them as uninitialized."""
+    if not (path / ".gitmodules").exists():
+        return
+    out = git(
+        path, "config", "-f", ".gitmodules", "--get-regexp", r"\.path$", check=False
+    )
+    for line in out.splitlines():
+        sub = path / line.split(maxsplit=1)[-1]
+        dotgit = sub / ".git"
+        if not dotgit.is_file():
+            continue
+        # The gitdir can exist yet be a stub (just a `config`), so ask git.
+        probe = subprocess.run(
+            ["git", "rev-parse", "--git-dir"], cwd=sub, capture_output=True
+        )
+        if probe.returncode != 0:
+            log(f"Removing stale submodule link {dotgit}")
+            if not DRY_RUN:
+                dotgit.unlink()
+
+
 def prepare_worktree(repo: Path, path: Path, sha: str) -> None:
     """Create (or reuse) a detached worktree at `path` checked out at `sha`."""
     if (path / ".git").exists():
+        repair_submodule_links(path)
         # Undo the harness's queries symlink before checking out over it.
         q = path / "benchmarks" / "queries"
         if q.is_symlink():
@@ -687,6 +734,7 @@ def count_steps(plan: Plan, targets: dict[str, list[str]], skip_data: bool) -> i
 def main(args: SimpleNamespace) -> int:
     global DRY_RUN
     DRY_RUN = args.dry_run
+    disable_submodule_recursion()
     plan = parse_command(args.command or [], args.raw, args.query)
     exclusive = (
         ("--baseline-ref", "--baseline-branch"),
@@ -753,7 +801,14 @@ def main(args: SimpleNamespace) -> int:
         base_sha = git(repo, "merge-base", changed_sha, main_ref)
         baseline_label = f"{base_sha[:7]} (merge-base)"
 
-    harness_ref = args.harness_ref or main_ref
+    # bench.sh/compare.py follow an explicit baseline, so an old baseline is not
+    # driven with flags its dfbench does not know; otherwise main, like the runner.
+    if args.harness_ref:
+        harness_ref = args.harness_ref
+    elif args.baseline_ref or args.baseline_branch:
+        harness_ref = baseline_label  # the ref, or the resolved <remote>/<branch>
+    else:
+        harness_ref = main_ref
     harness_sha = resolve(repo, harness_ref)
 
     # --- worktrees --------------------------------------------------------
@@ -1323,7 +1378,8 @@ def cli(
     harness_ref: Annotated[
         Optional[str],
         typer.Option(
-            help="Ref providing bench.sh/compare.py (default: <remote>/main).",
+            help="Ref providing bench.sh/compare.py (default: --baseline-ref or "
+            "--baseline-branch if given, else <remote>/main).",
             rich_help_panel=RUN,
         ),
     ] = None,
