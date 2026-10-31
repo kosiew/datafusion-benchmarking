@@ -1128,188 +1128,326 @@ def run_benchmarks(context: BenchmarkContext) -> list[str]:
     return plan.benches
 
 
-def compare_results(context: BenchmarkContext) -> str:
-    base, changed = context.base, context.changed
-    harness_bench = context.harness_bench
-    with ui.step("Comparing results"):
-        report: list[str] = []
-        base_results = results_dir(harness_bench, base)
-        if results_json_files(base_results) and results_json_files(
-            results_dir(harness_bench, changed)
-        ):
-            if not shutil.which("uv"):
-                report.append("`uv` not found: bench.sh compare skipped\n")
-            else:
-                summary = run(
-                    ["./bench.sh", "compare", base.name, changed.name],
-                    harness_bench,
-                    check=False,
-                )
-                detail = run(
-                    ["./bench.sh", "compare_detail", base.name, changed.name],
-                    harness_bench,
-                    check=False,
-                )
-                report.append(summary)
-                report.append(
-                    "\nDistribution per query (min / mean ±stddev / max):\n\n"
-                    + detail
-                )
+def compare_shell_results(context: BenchmarkContext) -> list[str]:
+    """bench.sh compare/compare_detail output, when both sides wrote results."""
+    base, changed, harness_bench = context.base, context.changed, context.harness_bench
+    if not (
+        results_json_files(results_dir(harness_bench, base))
+        and results_json_files(results_dir(harness_bench, changed))
+    ):
+        return []
+    if not shutil.which("uv"):
+        return ["`uv` not found: bench.sh compare skipped\n"]
+    summary = run(
+        ["./bench.sh", "compare", base.name, changed.name],
+        harness_bench,
+        check=False,
+    )
+    detail = run(
+        ["./bench.sh", "compare_detail", base.name, changed.name],
+        harness_bench,
+        check=False,
+    )
+    return [
+        summary,
+        "\nDistribution per query (min / mean ±stddev / max):\n\n" + detail,
+    ]
 
-        base_crit = has_criterion_baseline(base.target_dir, base.name)
-        changed_crit = has_criterion_baseline(changed.target_dir, changed.name)
-        if changed_crit:
-            if not shutil.which("critcmp"):
-                report.append(
-                    "\n`critcmp` not found (cargo install critcmp): Criterion "
-                    "comparison skipped\n"
-                )
-            else:
-                exports = context.workdir / "criterion-exports" / context.run_id
-                exports.mkdir(parents=True, exist_ok=True)
-                files = []
-                for side, ok in ((base, base_crit), (changed, changed_crit)):
-                    if not ok:
-                        continue
-                    path = exports / f"{side.name}.json"
-                    path.write_text(
-                        run(
-                            [
-                                "critcmp",
-                                "--target-dir",
-                                str(side.target_dir),
-                                "--export",
-                                side.name,
-                            ],
-                            side.dir,
-                        )
-                    )
-                    files.append(str(path))
-                out = run(["critcmp", *files], context.workdir, check=False)
-                prefix = (
-                    ""
-                    if base_crit
-                    else "New benchmark — changed-only Criterion results:\n\n"
-                )
-                report.append(("\n" if report else "") + prefix + out)
+
+def compare_criterion_results(context: BenchmarkContext, follows: bool) -> str:
+    """critcmp output for the sides that saved a Criterion baseline; `follows`
+    means it comes after other report text and needs a separating newline."""
+    base, changed = context.base, context.changed
+    base_crit = has_criterion_baseline(base.target_dir, base.name)
+    if not has_criterion_baseline(changed.target_dir, changed.name):
+        return ""
+    if not shutil.which("critcmp"):
+        return (
+            "\n`critcmp` not found (cargo install critcmp): Criterion "
+            "comparison skipped\n"
+        )
+    exports = context.workdir / "criterion-exports" / context.run_id
+    exports.mkdir(parents=True, exist_ok=True)
+    files = []
+    for side in (base, changed) if base_crit else (changed,):
+        path = exports / f"{side.name}.json"
+        path.write_text(
+            run(
+                [
+                    "critcmp",
+                    "--target-dir",
+                    str(side.target_dir),
+                    "--export",
+                    side.name,
+                ],
+                side.dir,
+            )
+        )
+        files.append(str(path))
+    out = run(["critcmp", *files], context.workdir, check=False)
+    prefix = "" if base_crit else "New benchmark — changed-only Criterion results:\n\n"
+    return ("\n" if follows else "") + prefix + out
+
+
+def compare_results(context: BenchmarkContext) -> str:
+    with ui.step("Comparing results"):
+        report = compare_shell_results(context)
+        report.append(compare_criterion_results(context, follows=bool(report)))
         return "".join(report) or "No comparable results were produced.\n"
 
 
-def write_report(
-    context: BenchmarkContext, requested: list[str], report_text: str
-) -> Path:
-    args = context.args
-    repo, base, changed = context.repo, context.base, context.changed
-    harness_bench = context.harness_bench
-    machine, cpu_details = machine_info()
-    command = (
-        context.plan.raw
-        if context.plan.raw
-        else "run benchmarks " + " ".join(context.plan.benches)
-    )
-    config_yaml = [f"command: {command}"]
-    if context.plan.query:
-        config_yaml.append(f"query: {context.plan.query}")
+def yaml_env(env: dict[str, str], indent: str) -> list[str]:
+    return [f"{indent}{key}: {json.dumps(value)}" for key, value in env.items()]
+
+
+def run_config_yaml(context: BenchmarkContext) -> list[str]:
+    """The run configuration, shaped like the runner's PR-comment YAML block."""
+    args, plan = context.args, context.plan
+    command = plan.raw if plan.raw else "run benchmarks " + " ".join(plan.benches)
+    lines = [f"command: {command}"]
+    if plan.query:
+        lines.append(f"query: {plan.query}")
     if context.shared_env:
-        config_yaml.append("env:")
-        config_yaml += [
-            f"  {key}: {json.dumps(value)}"
-            for key, value in context.shared_env.items()
-        ]
+        lines.append("env:")
+        lines += yaml_env(context.shared_env, "  ")
     for title, ref, extra in (
-        (
-            "baseline",
-            args.baseline_ref or args.baseline_branch,
-            args.baseline_env,
-        ),
+        ("baseline", args.baseline_ref or args.baseline_branch, args.baseline_env),
         ("changed", args.changed_ref or args.changed_branch, args.changed_env),
     ):
-        if ref or extra:
-            config_yaml.append(f"{title}:")
-            if ref:
-                config_yaml.append(f"  ref: {json.dumps(ref)}")
-            if extra:
-                config_yaml.append("  env:")
-                config_yaml += [
-                    f"    {key}: {json.dumps(value)}"
-                    for key, value in parse_env(extra, title).items()
-                ]
+        if not (ref or extra):
+            continue
+        lines.append(f"{title}:")
+        if ref:
+            lines.append(f"  ref: {json.dumps(ref)}")
+        if extra:
+            lines.append("  env:")
+            lines += yaml_env(parse_env(extra, title), "    ")
     if context.forced:
-        config_yaml.append(
+        lines.append(
             "build: "
             + " ".join(f"{key}={value}" for key, value in context.forced.items())
         )
+    return lines
 
-    md = [
-        f"🤖 Benchmark completed (local) | {dt.datetime.now():%Y-%m-%d %H:%M}\n",
-        f"**Machine:** {machine}\n",
-        f"Comparing `{changed.label}` ({changed.sha[:7]}) "
-        f"to `{base.label}` ({base.sha[:7]})\n",
-        "<details><summary>Run configuration</summary>\n\n```yaml\n"
-        + "\n".join(config_yaml)
-        + "\n```\n\n</details>\n",
-    ]
 
-    workload: list[str] = []
+def workload_section(context: BenchmarkContext, requested: list[str]) -> list[str]:
+    """Harness, failures, result coverage and workload-file differences."""
+    base, changed, harness_bench = context.base, context.changed, context.harness_bench
+    lines: list[str] = []
     if not context.plan.raw and any(
         bench not in criterion_targets_cache(changed) for bench in requested
     ):
-        workload.append(
+        lines.append(
             f"**Workload:** `bench.sh` from `{context.harness_ref}` "
             f"({context.harness_sha[:7]}); "
             "each side runs its own query files.\n"
         )
     failures = [
-        (side, bench, error)
+        f"- `{bench}` on **{side.name}**: {error.splitlines()[0]}"
         for side in (base, changed)
         for bench, error in side.failures
     ]
     if failures:
-        workload.append("**Failures:**\n")
-        workload += [
-            f"- `{bench}` on **{side.name}**: {error.splitlines()[0]}"
-            for side, bench, error in failures
-        ]
-        workload.append("")
+        lines += ["**Failures:**\n", *failures, ""]
     cov = coverage_section(
         results_dir(harness_bench, base), results_dir(harness_bench, changed)
     )
     if cov:
-        workload.append("**Result coverage:**\n")
-        workload += cov + [""]
-    wd = workload_diff(repo, base, changed, args.changed_in_place)
+        lines += ["**Result coverage:**\n", *cov, ""]
+    wd = workload_diff(context.repo, base, changed, context.args.changed_in_place)
     if wd:
-        workload.append("**Workload files differing between sides:**\n")
-        workload += (
-            wd[:25] + ([f"- … and {len(wd) - 25} more"] if len(wd) > 25 else []) + [""]
-        )
+        lines.append("**Workload files differing between sides:**\n")
+        lines += wd[:25]
+        if len(wd) > 25:
+            lines.append(f"- … and {len(wd) - 25} more")
+        lines.append("")
+    return lines
+
+
+def details_block(summary: str, body: str) -> str:
+    return f"<details><summary>{summary}</summary>\n\n{body}\n</details>\n"
+
+
+def write_report(
+    context: BenchmarkContext, requested: list[str], report_text: str
+) -> Path:
+    base, changed = context.base, context.changed
+    machine, cpu_details = machine_info()
+    config = "\n".join(run_config_yaml(context))
+    md = [
+        f"🤖 Benchmark completed (local) | {dt.datetime.now():%Y-%m-%d %H:%M}\n",
+        f"**Machine:** {machine}\n",
+        f"Comparing `{changed.label}` ({changed.sha[:7]}) "
+        f"to `{base.label}` ({base.sha[:7]})\n",
+        details_block("Run configuration", f"```yaml\n{config}\n```\n"),
+    ]
+    workload = workload_section(context, requested)
     if workload:
         md.append("\n".join(workload))
-
     if cpu_details:
-        md.append(
-            f"<details><summary>CPU Details</summary>\n\n```\n{cpu_details}"
-            "\n```\n\n</details>\n"
-        )
+        md.append(details_block("CPU Details", f"```\n{cpu_details}\n```\n"))
     md.append(
         f"<details><summary>Details</summary>\n<p>\n\n```\n"
         f"{report_text.rstrip()}\n```\n\n</p>\n</details>\n"
     )
-    pool = pool_section(harness_bench, base, changed)
+    pool = pool_section(context.harness_bench, base, changed)
     if pool:
-        md.append(
-            f"<details><summary>Memory Pool Peaks</summary>\n\n{pool}\n</details>\n"
-        )
-    md.append(
-        "<details><summary>Resource Usage</summary>\n\n"
-        f"{resource_section([base, changed])}\n</details>\n"
-    )
+        md.append(details_block("Memory Pool Peaks", pool))
+    md.append(details_block("Resource Usage", resource_section([base, changed])))
     md.append(f"_Logs: `{context.logs}`_\n")
 
-    out_path = args.output or context.workdir / "reports" / f"{context.run_id}.md"
+    out_path = (
+        context.args.output or context.workdir / "reports" / f"{context.run_id}.md"
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(md))
     return out_path
+
+
+def check_exclusive_options(args: SimpleNamespace) -> None:
+    exclusive = (
+        ("--baseline-ref", "--baseline-branch"),
+        ("--changed-ref", "--changed-branch", "--changed-in-place"),
+    )
+    for group in exclusive:
+        given = [o for o in group if getattr(args, o[2:].replace("-", "_"))]
+        if len(given) > 1:
+            raise SystemExit(f"error: {' and '.join(given)} are mutually exclusive")
+
+
+def resolve_changed(
+    args: SimpleNamespace, repo: Path, remote: str, fetch: bool
+) -> tuple[str, str]:
+    """Return the changed side's (display label, sha)."""
+    if args.changed_branch:
+        return resolve_branch(repo, remote, args.changed_branch, fetch)
+    if args.changed_ref:
+        return args.changed_ref, resolve(repo, args.changed_ref)
+    sha = resolve(repo, "HEAD")
+    display = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    if display == "HEAD":
+        display = sha[:7]
+    dirty = git(repo, "status", "--porcelain", "--untracked-files=no")
+    if args.changed_in_place:
+        if dirty:
+            display += " + uncommitted changes"
+    elif dirty:
+        warn(
+            "repo has uncommitted changes; they are NOT benchmarked "
+            "(use --changed-in-place to include them)"
+        )
+    return display, sha
+
+
+def resolve_baseline(
+    args: SimpleNamespace, repo: Path, remote: str, fetch: bool, changed_sha: str
+) -> tuple[str, str]:
+    """Return the baseline's (label, sha); the merge-base with main by default."""
+    main_ref = f"{remote}/main"
+    # <remote>/main is only needed for the default baseline (merge-base) and the
+    # harness that defaults with it; an explicit baseline also supplies the harness.
+    if fetch and not (args.baseline_ref or args.baseline_branch):
+        log(f"Fetching {remote} main")
+        if not DRY_RUN:
+            run(["git", "fetch", remote, "main"], repo, check=False)
+    if args.baseline_branch:
+        return resolve_branch(repo, remote, args.baseline_branch, fetch)
+    if args.baseline_ref:
+        if fetch and not DRY_RUN:
+            run(["git", "fetch", remote, "--tags"], repo, check=False)
+        return args.baseline_ref, resolve(repo, args.baseline_ref)
+    resolve(repo, main_ref)
+    sha = git(repo, "merge-base", changed_sha, main_ref)
+    return f"{sha[:7]} (merge-base)", sha
+
+
+def choose_harness_ref(args: SimpleNamespace, remote: str, baseline_label: str) -> str:
+    # bench.sh/compare.py follow an explicit baseline, so an old baseline is not
+    # driven with flags its dfbench does not know; otherwise main, like the runner.
+    if args.harness_ref:
+        return args.harness_ref
+    if args.baseline_ref or args.baseline_branch:
+        return baseline_label  # the ref, or the resolved <remote>/<branch>
+    return f"{remote}/main"
+
+
+def make_sides(
+    args: SimpleNamespace,
+    repo: Path,
+    workdir: Path,
+    baseline: tuple[str, str],
+    changed_ref: tuple[str, str],
+    shared_env: dict[str, str],
+) -> tuple[Side, Side]:
+    (baseline_label, base_sha), (changed_display, changed_sha) = baseline, changed_ref
+    base = Side(
+        BASE_LABEL,
+        baseline_label,
+        workdir / "baseline",
+        base_sha,
+        workdir / "baseline" / "target",
+    )
+    if args.changed_in_place:
+        target = Path(os.environ.get("CARGO_TARGET_DIR", repo / "target"))
+        changed = Side(CHANGED_LABEL, changed_display, repo, changed_sha, target)
+    else:
+        changed = Side(
+            CHANGED_LABEL,
+            changed_display,
+            workdir / "changed",
+            changed_sha,
+            workdir / "changed" / "target",
+        )
+    base.env = {**shared_env, **parse_env(args.baseline_env, "--baseline-env")}
+    changed.env = {**shared_env, **parse_env(args.changed_env, "--changed-env")}
+    return base, changed
+
+
+def prepare_workspace(
+    args: SimpleNamespace,
+    repo: Path,
+    base: Side,
+    changed: Side,
+    harness: Path,
+    harness_sha: str,
+    data_dir: Path,
+) -> Path:
+    """Check out the worktrees and reset per-side results; return the harness's
+    main queries directory."""
+    with ui.step("Preparing worktrees"):
+        prepare_worktree(repo, base.dir, base.sha)
+        if not args.changed_in_place:
+            prepare_worktree(repo, changed.dir, changed.sha)
+        prepare_worktree(repo, harness, harness_sha)
+    harness_bench = harness / "benchmarks"
+    main_queries = prepare_harness_queries(harness_bench)
+    if not DRY_RUN:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        for side in (base, changed):
+            shutil.rmtree(results_dir(harness_bench, side), ignore_errors=True)
+            results_dir(harness_bench, side).mkdir(parents=True, exist_ok=True)
+            clear_criterion_baseline(side.target_dir, side.name)
+    return main_queries
+
+
+def finish(context: BenchmarkContext, requested: list[str]) -> int:
+    """Compare, write and print the report, then open it on success."""
+    args = context.args
+    report_text = compare_results(context)
+    out_path = write_report(context, requested, report_text)
+    ui.stop()
+    if args.clean_after:
+        clean_targets(context.workdir)
+
+    print("\n" + "=" * 78)
+    print(report_text.rstrip())
+    print("=" * 78)
+    log(f"Markdown report: {out_path}")
+    if context.changed.failures:
+        return 1
+    if not args.no_open:
+        open_report(out_path)
+    return 0
 
 
 def main(args: SimpleNamespace) -> int:
@@ -1319,14 +1457,7 @@ def main(args: SimpleNamespace) -> int:
     # Inherited from the caller's shell; uv would warn that it does not match
     # the harness project's environment.
     os.environ.pop("VIRTUAL_ENV", None)
-    exclusive = (
-        ("--baseline-ref", "--baseline-branch"),
-        ("--changed-ref", "--changed-branch", "--changed-in-place"),
-    )
-    for group in exclusive:
-        given = [o for o in group if getattr(args, o[2:].replace("-", "_"))]
-        if len(given) > 1:
-            raise SystemExit(f"error: {' and '.join(given)} are mutually exclusive")
+    check_exclusive_options(args)
 
     repo = (args.repo or default_repo()).expanduser().resolve()
     if not (repo / "benchmarks" / "bench.sh").exists():
@@ -1347,117 +1478,35 @@ def main(args: SimpleNamespace) -> int:
         if not shutil.which(tool):
             raise SystemExit(f"error: `{tool}` not found on PATH")
 
-    # --- resolve changed -------------------------------------------------
-    if args.changed_branch:
-        changed_display, changed_sha = resolve_branch(
-            repo, remote, args.changed_branch, fetch
-        )
-    elif args.changed_ref:
-        changed_display, changed_sha = args.changed_ref, resolve(repo, args.changed_ref)
-    else:
-        changed_sha = resolve(repo, "HEAD")
-        changed_display = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-        if changed_display == "HEAD":
-            changed_display = changed_sha[:7]
-        dirty = git(repo, "status", "--porcelain", "--untracked-files=no")
-        if args.changed_in_place:
-            if dirty:
-                changed_display += " + uncommitted changes"
-        elif dirty:
-            warn(
-                "repo has uncommitted changes; they are NOT benchmarked "
-                "(use --changed-in-place to include them)"
-            )
-
-    # --- resolve baseline ------------------------------------------------
-    main_ref = f"{remote}/main"
-    # <remote>/main is only needed for the default baseline (merge-base) and the
-    # harness that defaults with it; an explicit baseline also supplies the harness.
-    if fetch and not (args.baseline_ref or args.baseline_branch):
-        log(f"Fetching {remote} main")
-        if not DRY_RUN:
-            run(["git", "fetch", remote, "main"], repo, check=False)
-    if args.baseline_branch:
-        baseline_label, base_sha = resolve_branch(
-            repo, remote, args.baseline_branch, fetch
-        )
-    elif args.baseline_ref:
-        if fetch and not DRY_RUN:
-            run(["git", "fetch", remote, "--tags"], repo, check=False)
-        base_sha = resolve(repo, args.baseline_ref)
-        baseline_label = args.baseline_ref
-    else:
-        resolve(repo, main_ref)
-        base_sha = git(repo, "merge-base", changed_sha, main_ref)
-        baseline_label = f"{base_sha[:7]} (merge-base)"
-
-    # bench.sh/compare.py follow an explicit baseline, so an old baseline is not
-    # driven with flags its dfbench does not know; otherwise main, like the runner.
-    if args.harness_ref:
-        harness_ref = args.harness_ref
-    elif args.baseline_ref or args.baseline_branch:
-        harness_ref = baseline_label  # the ref, or the resolved <remote>/<branch>
-    else:
-        harness_ref = main_ref
+    changed_ref = resolve_changed(args, repo, remote, fetch)
+    baseline = resolve_baseline(args, repo, remote, fetch, changed_ref[1])
+    harness_ref = choose_harness_ref(args, remote, baseline[0])
     harness_sha = resolve(repo, harness_ref)
 
-    # --- worktrees --------------------------------------------------------
-    base = Side(
-        BASE_LABEL,
-        baseline_label,
-        workdir / "baseline",
-        base_sha,
-        workdir / "baseline" / "target",
-    )
-    if args.changed_in_place:
-        target = Path(os.environ.get("CARGO_TARGET_DIR", repo / "target"))
-        changed = Side(CHANGED_LABEL, changed_display, repo, changed_sha, target)
-    else:
-        changed = Side(
-            CHANGED_LABEL,
-            changed_display,
-            workdir / "changed",
-            changed_sha,
-            workdir / "changed" / "target",
-        )
-    harness = workdir / "harness"
-    harness_bench = harness / "benchmarks"
-
     shared_env = parse_env(args.env, "--env")
-    base.env = {**shared_env, **parse_env(args.baseline_env, "--baseline-env")}
-    changed.env = {**shared_env, **parse_env(args.changed_env, "--changed-env")}
+    base, changed = make_sides(args, repo, workdir, baseline, changed_ref, shared_env)
     forced = {} if args.no_thin_lto else dict(THIN_LTO_ENV)
     forced["CARGO_BUILD_JOBS"] = str(args.jobs)
 
     log(f"Repo:      {repo} (upstream remote: {remote})")
     log(f"Workdir:   {workdir}")
-    log(f"Changed:   {changed.label} ({changed_sha[:10]}) at {changed.dir}")
-    log(f"Baseline:  {baseline_label} ({base_sha[:10]})")
+    log(f"Changed:   {changed.label} ({changed.sha[:10]}) at {changed.dir}")
+    log(f"Baseline:  {base.label} ({base.sha[:10]})")
     log(f"Harness:   {harness_ref} ({harness_sha[:10]})")
     log(f"Command:   {plan.raw if plan.raw else ' '.join(plan.benches)}")
-    if base_sha == changed_sha and not args.changed_in_place:
+    if base.sha == changed.sha and not args.changed_in_place:
         warn(
             "baseline and changed are the same commit (A/A run: differences are noise)"
         )
 
     if not DRY_RUN:
         ui.start(total=count_steps(plan, {}, args.skip_data) + 1)
-    with ui.step("Preparing worktrees"):
-        prepare_worktree(repo, base.dir, base_sha)
-        if not args.changed_in_place:
-            prepare_worktree(repo, changed.dir, changed_sha)
-        prepare_worktree(repo, harness, harness_sha)
-    main_queries = prepare_harness_queries(harness_bench)
-    if not DRY_RUN:
-        data_dir.mkdir(parents=True, exist_ok=True)
-        for s in (base, changed):
-            shutil.rmtree(results_dir(harness_bench, s), ignore_errors=True)
-            results_dir(harness_bench, s).mkdir(parents=True, exist_ok=True)
-            clear_criterion_baseline(s.target_dir, s.name)
+    harness = workdir / "harness"
+    main_queries = prepare_workspace(
+        args, repo, base, changed, harness, harness_sha, data_dir
+    )
 
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    logs = workdir / "logs" / run_id
-
     context = BenchmarkContext(
         args=args,
         plan=plan,
@@ -1466,36 +1515,20 @@ def main(args: SimpleNamespace) -> int:
         data_dir=data_dir,
         base=base,
         changed=changed,
-        harness_bench=harness_bench,
+        harness_bench=harness / "benchmarks",
         main_queries=main_queries,
         shared_env=shared_env,
         forced=forced,
         run_id=run_id,
-        logs=logs,
+        logs=workdir / "logs" / run_id,
         harness_ref=harness_ref,
         harness_sha=harness_sha,
     )
     requested = run_benchmarks(context)
-
     if DRY_RUN:
         log("Dry run complete")
         return 0
-
-    report_text = compare_results(context)
-    out_path = write_report(context, requested, report_text)
-    ui.stop()
-    if args.clean_after:
-        clean_targets(workdir)
-
-    print("\n" + "=" * 78)
-    print(report_text.rstrip())
-    print("=" * 78)
-    log(f"Markdown report: {out_path}")
-    if changed.failures:
-        return 1
-    if not args.no_open:
-        open_report(out_path)
-    return 0
+    return finish(context, requested)
 
 
 def open_report(path: Path) -> None:
