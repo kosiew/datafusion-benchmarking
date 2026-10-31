@@ -1367,14 +1367,31 @@ def main(args: SimpleNamespace) -> int:
 
 
 def open_report(path: Path) -> None:
-    """Open the report in vi, when there is a terminal to run it in."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        log("Not a terminal; not opening the report in vi")
-        return
-    if not shutil.which("vi"):
-        warn("vi not found; not opening the report")
-        return
-    subprocess.run(["vi", str(path)])
+    """Open the report without blocking: the script exits and the calling
+    shell gets its prompt back.
+
+    MacVim (`mvim`) opens a GUI window and returns at once. Without it, terminal
+    vi cannot share the calling terminal with that shell, so it opens in a new
+    tmux window (or, outside tmux on macOS, a new Terminal.app window)."""
+    if shutil.which("mvim"):
+        if subprocess.run(["mvim", str(path)]).returncode == 0:
+            log("Opened the report in MacVim")
+            return
+    vi_cmd = f"vi {shlex.quote(str(path))}"
+    if os.environ.get("TMUX") and shutil.which("tmux"):
+        rc = subprocess.run(
+            ["tmux", "new-window", "-n", "bench-report", vi_cmd]
+        ).returncode
+        if rc == 0:
+            log("Opened the report in vi in tmux window 'bench-report'")
+            return
+    elif sys.platform == "darwin" and shutil.which("osascript"):
+        script = f'tell application "Terminal" to do script {json.dumps(vi_cmd)}'
+        rc = subprocess.run(["osascript", "-e", script], capture_output=True).returncode
+        if rc == 0:
+            log("Opened the report in vi in a new Terminal window")
+            return
+    log("Could not open a separate window for vi; open the report yourself")
 
 
 _TARGETS_CACHE: dict[Path, dict[str, list[str]]] = {}
@@ -1590,7 +1607,8 @@ def cli(
         bool,
         typer.Option(
             "--no-open",
-            help="Do not open the Markdown report in vi after a successful run.",
+            help="Do not open the Markdown report in MacVim (or vi in a new tmux "
+            "window) after a successful run.",
         ),
     ] = False,
     dry_run: Annotated[
