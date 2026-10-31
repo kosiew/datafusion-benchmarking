@@ -26,6 +26,8 @@ The benchmark command can be given in any of these forms:
     local_bench.py ./bench.sh run tpch_mem 5              # bench.sh form (query 5)
     local_bench.py cargo bench --bench sql_planner        # raw command (auto-detected)
     local_bench.py --raw -- my_script.sh {results_name}   # raw command (forced)
+    local_bench.py --clean                                # delete worktree target dirs
+    local_bench.py --clean-after tpch_mem                 # ... once the report is written
 
 Raw commands run in each side's checkout with SIDE, RESULTS_NAME, DATAFUSION_DIR,
 DATA_DIR, RESULTS_DIR and CARGO_TARGET_DIR set; `{results_name}`, `{side_dir}`,
@@ -717,6 +719,77 @@ def default_repo() -> Path:
     return Path.home() / "GitHub" / "datafusion"
 
 
+WORKTREES = ("baseline", "changed", "harness")
+
+
+def dir_size(path: Path) -> int:
+    out = run(["du", "-sk", str(path)], Path("/"), check=False).split()
+    return int(out[0]) * 1024 if out and out[0].isdigit() else 0
+
+
+def clean_targets(workdir: Path) -> None:
+    """Delete the cargo target dirs of the script's own worktrees.
+
+    Only `<workdir>/{baseline,changed,harness}/target` are touched — never the
+    repo's own target dir used by --changed-in-place. Worktrees, data, logs and
+    reports are kept, so the next run only has to rebuild.
+    """
+    total = 0
+    for name in WORKTREES:
+        target = workdir / name / "target"
+        if not target.is_dir() or target.is_symlink():
+            continue
+        size = dir_size(target)
+        total += size
+        if DRY_RUN:
+            log(f"Would remove {target} ({human_bytes(size)})")
+            continue
+        with ui.step(f"Removing {name}/target ({human_bytes(size)})"):
+            shutil.rmtree(target)
+        log(f"Removed {target} ({human_bytes(size)})")
+    if total == 0:
+        log(f"No target dirs under {workdir}")
+    else:
+        log(f"{'Would free' if DRY_RUN else 'Freed'} {human_bytes(total)}")
+
+
+# Rust's release profile strips debuginfo by default (since 1.77). On macOS 27
+# the stripped Python extension modules that `bench.sh data` builds from source
+# (falsa, the h2o generator) fail to load: "mis-aligned LINKEDIT string pool".
+DATA_GEN_ENV = (
+    {"CARGO_PROFILE_RELEASE_STRIP": "false"} if sys.platform == "darwin" else {}
+)
+
+
+def ensure_falsa(harness_bench: Path, env: dict[str, str]) -> None:
+    """Make sure `uv run falsa` (h2o data generator) imports in the harness
+    project. uv caches built wheels without regard to the build env, so a
+    broken build from before DATA_GEN_ENV keeps being reinstalled until its
+    cache entry is cleared."""
+    if DRY_RUN:
+        return
+
+    def imports() -> bool:
+        probe = subprocess.run(
+            ["uv", "run", "python", "-c", "import falsa.native"],
+            cwd=harness_bench,
+            env={**os.environ, **env},
+            capture_output=True,
+            text=True,
+        )
+        return probe.returncode == 0
+
+    with ui.step("Checking h2o data generator (falsa)"):
+        if imports():
+            return
+        log("falsa does not import; clearing uv's cached build and rebuilding")
+        run(["uv", "cache", "clean", "falsa"], harness_bench, check=False)
+        shutil.rmtree(harness_bench.parent / ".venv", ignore_errors=True)
+        shutil.rmtree(harness_bench / ".venv", ignore_errors=True)
+        if not imports():
+            raise CommandError("falsa (h2o data generator) still fails to import")
+
+
 def count_steps(plan: Plan, targets: dict[str, list[str]], skip_data: bool) -> int:
     """Commands `main` will run (one progress step each), plus compare/report."""
     if plan.raw:
@@ -726,7 +799,7 @@ def count_steps(plan: Plan, targets: dict[str, list[str]], skip_data: bool) -> i
         if bench in targets:
             steps += 0 if skip_data else len(CRITERION_DATASETS.get(bench, []))
         else:
-            steps += 0 if skip_data else 1
+            steps += 0 if skip_data else 1 + bench.startswith("h2o")
         steps += 2
     return steps + 1
 
@@ -735,7 +808,9 @@ def main(args: SimpleNamespace) -> int:
     global DRY_RUN
     DRY_RUN = args.dry_run
     disable_submodule_recursion()
-    plan = parse_command(args.command or [], args.raw, args.query)
+    # Inherited from the caller's shell; uv would warn that it does not match
+    # the harness project's environment.
+    os.environ.pop("VIRTUAL_ENV", None)
     exclusive = (
         ("--baseline-ref", "--baseline-branch"),
         ("--changed-ref", "--changed-branch", "--changed-in-place"),
@@ -752,6 +827,11 @@ def main(args: SimpleNamespace) -> int:
         (args.workdir or repo.parent / "datafusion-bench-local").expanduser().resolve()
     )
     data_dir = (args.data_dir or repo / "benchmarks" / "data").expanduser().resolve()
+    if args.clean:
+        clean_targets(workdir)
+        if not args.command:
+            return 0
+    plan = parse_command(args.command or [], args.raw, args.query)
     remote = args.remote or detect_upstream_remote(repo)
     fetch = not args.no_fetch
 
@@ -1028,22 +1108,32 @@ def main(args: SimpleNamespace) -> int:
                 data_bench = bench
                 if bench in TPCH_DIRECT:
                     data_bench = "tpch10" if TPCH_DIRECT[bench][0] == "10" else "tpch"
+                data_env = {
+                    "DATA_DIR": str(data_dir),
+                    "DATAFUSION_DIR": str(changed.dir),
+                    "CARGO_TARGET_DIR": str(changed.target_dir),
+                    **forced,
+                    **DATA_GEN_ENV,
+                }
                 try:
+                    if bench.startswith("h2o"):
+                        ensure_falsa(harness_bench, data_env)
                     run_logged(
                         ["./bench.sh", "data", data_bench],
                         harness_bench,
-                        {
-                            "DATA_DIR": str(data_dir),
-                            "DATAFUSION_DIR": str(changed.dir),
-                            "CARGO_TARGET_DIR": str(changed.target_dir),
-                            **forced,
-                        },
+                        data_env,
                         logs / f"data-{bench}.log",
                         args.quiet,
                         label=f"Generating data for {bench}",
                     )
                 except CommandError as e:
-                    warn(f"data generation for {bench} failed: {e}")
+                    # Running without its data only fails later, on both sides.
+                    warn(f"data generation for {bench} failed, skipping it: {e}")
+                    for s in (base, changed):
+                        s.failures.append((bench, f"data generation failed: {e}"))
+                    ui.advance()
+                    ui.advance()
+                    continue
 
             for s in order:
                 rdir = results_dir(harness_bench, s)
@@ -1260,6 +1350,8 @@ def main(args: SimpleNamespace) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(md))
     ui.stop()
+    if args.clean_after:
+        clean_targets(workdir)
 
     print("\n" + "=" * 78)
     print(report_text.rstrip())
@@ -1459,6 +1551,22 @@ def cli(
             "--quiet",
             help="Only write benchmark output to log files (progress still shown).",
             rich_help_panel=RUN,
+        ),
+    ] = False,
+    clean: Annotated[
+        bool,
+        typer.Option(
+            "--clean",
+            help="Delete the worktrees' target dirs (<workdir>/{baseline,changed,"
+            "harness}/target) and exit; with a command, delete them and then run "
+            "it from a clean build. Never touches the repo's own target dir.",
+        ),
+    ] = False,
+    clean_after: Annotated[
+        bool,
+        typer.Option(
+            "--clean-after",
+            help="Delete the worktrees' target dirs once the report is written.",
         ),
     ] = False,
     dry_run: Annotated[
