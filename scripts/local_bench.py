@@ -637,7 +637,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="keep DataFusion's fat LTO (the GKE runner forces thin)",
     )
-    r.add_argument("--jobs", type=int, help="CARGO_BUILD_JOBS (GKE runner uses 5)")
+    r.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="CARGO_BUILD_JOBS (default: 1 to avoid OOM; GKE runner uses 5)",
+    )
     r.add_argument(
         "--sequential-build",
         action="store_true",
@@ -761,8 +766,7 @@ def main() -> int:
     base.env = {**shared_env, **parse_env(args.baseline_env, "--baseline-env")}
     changed.env = {**shared_env, **parse_env(args.changed_env, "--changed-env")}
     forced = {} if args.no_thin_lto else dict(THIN_LTO_ENV)
-    if args.jobs:
-        forced["CARGO_BUILD_JOBS"] = str(args.jobs)
+    forced["CARGO_BUILD_JOBS"] = str(args.jobs)
 
     log(f"Repo:      {repo} (upstream remote: {remote})")
     log(f"Workdir:   {workdir}")
