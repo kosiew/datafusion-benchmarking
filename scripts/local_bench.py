@@ -863,7 +863,9 @@ def main(args: SimpleNamespace) -> int:
 
     # --- resolve baseline ------------------------------------------------
     main_ref = f"{remote}/main"
-    if fetch:
+    # <remote>/main is only needed for the default baseline (merge-base) and the
+    # harness that defaults with it; an explicit baseline also supplies the harness.
+    if fetch and not (args.baseline_ref or args.baseline_branch):
         log(f"Fetching {remote} main")
         if not DRY_RUN:
             run(["git", "fetch", remote, "main"], repo, check=False)
